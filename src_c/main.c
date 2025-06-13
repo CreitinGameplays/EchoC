@@ -227,16 +227,16 @@ Value value_deep_copy(Value original) {
         new_func->body_end_token_original_col = original_func->body_end_token_original_col;
         new_func->definition_scope = original_func->definition_scope; // Share the definition scope
         // The original_func (from symbol table or another Value) already owns its source_text_owned_copy.
-        // The new_func (the copy being made) must also get its own owned copy.
-
-
         // The original_func (from symbol table or another Value) already owns its source_text_owned_copy.
         // The new_func (the copy being made) must also get its own owned copy.
-        if (original_func->source_text_owned_copy && original_func->is_source_owner) {
+        // The new_func (the copy being made) will own its duplicated text.
+        // The original_func->source_text_owned_copy points to the text buffer (e.g. from main lexer or another Function's owned copy).
+        if (original_func->source_text_owned_copy) {
             new_func->source_text_owned_copy = strdup(original_func->source_text_owned_copy);
             if (!new_func->source_text_owned_copy) { /* error, cleanup */ report_error("System", "Failed to strdup function source text in copy", NULL); }
         } else {
-            new_func->source_text_owned_copy = NULL; // Should not happen if always set
+            // This case implies original_func had no source text, which might be an issue elsewhere or intentional for some builtins (though unlikely for EchoC funcs)
+            new_func->source_text_owned_copy = NULL;
         }
         new_func->source_text_length = original_func->source_text_length; // Copy length
         // CRITICAL: Update the copied body_start_state to use the new_func's owned text
