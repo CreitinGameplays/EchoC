@@ -1,6 +1,6 @@
 ### EchoC is a Python-inspired programming language written and compiled with C!
 
-Ensure you have Python 3.10> installed and GCC (Linux recommended).
+Ensure you have `Python 3.10>` installed (for compilation) and GCC (linux recommended because linux is goated).
 
 Compile:
 ```
