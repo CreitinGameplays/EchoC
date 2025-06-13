@@ -1,0 +1,71 @@
+-- module_test.ecc --
+show:"--- module_test.ecc is being loaded and executed! ---":
+
+let: module_global_var = "I am a global in module_test!":
+let: another_module_var = 42.5:
+
+funct: simple_module_func():
+    return: "Hello from simple_module_func in module_test!":
+end:
+
+funct: func_using_global():
+    return: "Func using global: %{module_global_var} and %{another_module_var}":
+end:
+
+blueprint: TestBlueprint:
+    let: bp_class_attr = "Blueprint Class Attribute from module_test":
+
+    funct: init(self, name):
+        let: self.name = name:
+        show:"TestBlueprint (module_test) init called for %{self.name}":
+    end:
+
+    funct: get_info(self):
+        return: "Instance '%{self.name}' of TestBlueprint. Class attr: %{TestBlueprint.bp_class_attr}. Global: %{module_global_var}":
+    end:
+
+    funct: static_like_method():
+        return: "Called static_like_method from TestBlueprint. Accessing class attr: %{TestBlueprint.bp_class_attr}":
+    end:
+end:
+
+blueprint: ComplexBlueprint:
+    let: bp_id = "ComplexBP_v1": -- class attribute --
+
+    funct: init(self, name_param):
+        let: self.instance_name = name_param:
+        let: self.data_store = {"status": "initialized", "log": []}: -- instance attribute, a dictionary --
+        show:"ComplexBlueprint '%{self.instance_name}' initialized. ID: %{ComplexBlueprint.bp_id}": -- show instance and class attr --
+    end:
+
+    funct: process_data(self, input_val):
+        show:"ComplexBlueprint.process_data called for '%{self.instance_name}' with input: %{input_val}":
+        self.data_store["log"].append("Processing input: %{input_val}"): -- append to array in dict --
+
+        if: input_val > 10:
+            show:"Input %{input_val} is greater than 10.":
+            let: self.data_store["status"] = "Processing large input":
+            let: temp_array = []:
+            let: temp_tuple = (0, "start"):
+            loop: for i from 1 to input_val % 5 + 1: -- loop based on input --
+                temp_array.append("Item %{i} for %{input_val}"):
+                let: temp_tuple = (temp_tuple[0] + i, temp_tuple[1] + "-%{i}"):
+                show:"  Loop iteration %{i}: Array: %{temp_array}, Tuple: %{temp_tuple}":
+            end:
+            let: self.data_store["loop_results"] = {"final_array": temp_array, "final_tuple": temp_tuple}:
+            self.data_store["log"].append("Large input processing complete."):
+        else:
+            show:"Input %{input_val} is 10 or less.":
+            let: self.data_store["status"] = "Processing small input":
+            let: self.data_store["small_input_data"] = ("small_val", input_val * 2): -- store a tuple --
+            self.data_store["log"].append("Small input processing complete."):
+        end:
+        return: self.data_store: -- return the dictionary --
+    end:
+
+    funct: get_status(self):
+        return: "Status of '%{self.instance_name}': %{self.data_store['status']}. Log count: %{self.data_store['log'].len()}":
+    end:
+end:
+
+show:"--- module_test.ecc finished execution. ---":

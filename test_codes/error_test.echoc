@@ -1,0 +1,209 @@
+show:"--- Error Handling Tests ---":
+
+show:"-- Test 1: Simple try-catch for a raise --":
+try:
+    show:"Inside try (Test 1)":
+    raise: "Test Error 1":
+    show:"This should not print (Test 1)":
+catch:
+    show:"Caught an error (Test 1)":
+end:
+show:"After try-catch (Test 1)":
+
+show:"-- Test 2: try-catch as e and print e --":
+try:
+    show:"Inside try (Test 2)":
+    let: err_msg_2 = "Custom Error Message 2":
+    raise: err_msg_2:
+    show:"This should not print (Test 2)":
+catch as e:
+    show:"Caught error (Test 2): %{e}":
+end:
+show:"After try-catch as e (Test 2)":
+
+show:"-- Test 3: try-finally where try succeeds --":
+try:
+    show:"Inside try (Test 3) - success":
+finally:
+    show:"Finally block executed (Test 3)":
+end:
+show:"After try-finally (Test 3)":
+
+show:"-- Test 4: try-finally where try raises (uncaught) --":
+-- This will propagate and halt if not caught by an outer try-catch in a real script --
+-- For testing, we'll wrap it to see finally execute --
+try:
+    try:
+        show:"Inside inner try (Test 4)":
+        raise: "Error in Test 4 to show finally":
+        show:"This should not print (Test 4 inner)":
+    finally:
+        show:"Inner Finally block executed (Test 4)":
+    end:
+    show:"This should not print (Test 4 outer after inner try)":
+catch as e_outer_4:
+    show:"Outer catch (Test 4) caught: %{e_outer_4}":
+end:
+show:"After try-finally with raise (Test 4)":
+
+show:"-- Test 5: try-catch-finally where try succeeds --":
+try:
+    show:"Inside try (Test 5) - success":
+catch as e_5:
+    show:"Catch block (Test 5) - should not run: %{e_5}":
+finally:
+    show:"Finally block executed (Test 5)":
+end:
+show:"After try-catch-finally success (Test 5)":
+
+show:"-- Test 6: try-catch-finally where try raises and catch handles --":
+try:
+    show:"Inside try (Test 6)":
+    raise: "Error for Test 6":
+    show:"This should not print (Test 6)":
+catch as e_6:
+    show:"Catch block (Test 6) handled: %{e_6}":
+finally:
+    show:"Finally block executed (Test 6)":
+end:
+show:"After try-catch-finally handled (Test 6)":
+
+show:"-- Test 7: try raises, catch raises, finally executes --":
+try:
+    try:
+        show:"Inside inner try (Test 7)":
+        raise: "Initial error (Test 7)":
+        show:"This should not print (Test 7 inner try)":
+    catch as e_inner_7:
+        show:"Inner catch (Test 7) got: %{e_inner_7}":
+        raise: "Error from inner catch (Test 7)":
+        show:"This should not print (Test 7 inner catch)":
+    finally:
+        show:"Inner finally executed (Test 7)":
+    end:
+    show:"This should not print (Test 7 outer try)":
+catch as e_outer_7:
+    show:"Outer catch (Test 7) got: %{e_outer_7}":
+end:
+show:"After try-catch-raise-finally (Test 7)":
+
+show:"-- Test 8: try raises, catch handles, finally raises --":
+try:
+    try:
+        show:"Inside inner try (Test 8)":
+        raise: "Initial error (Test 8)":
+        show:"This should not print (Test 8 inner try)":
+    catch as e_inner_8:
+        show:"Inner catch (Test 8) got: %{e_inner_8}":
+    finally:
+        show:"Inner finally executed (Test 8), now raising from finally":
+        raise: "Error from finally (Test 8)":
+        show:"This should not print (Test 8 inner finally)":
+    end:
+    show:"This should not print (Test 8 outer try)":
+catch as e_outer_8:
+    show:"Outer catch (Test 8) got: %{e_outer_8}":
+end:
+show:"After try-catch-finally-raise (Test 8)":
+
+show:"-- Test 9: Nested try-catch blocks --":
+try:
+    show:"Outer try (Test 9)":
+    try:
+        show:"Inner try (Test 9)":
+        raise: "Inner error (Test 9)":
+    catch as e_inner_9:
+        show:"Inner catch (Test 9) got: %{e_inner_9}":
+        raise: "Error propagated from inner catch (Test 9)":
+    end:
+    show:"Outer try after inner (Test 9) - should not print":
+catch as e_outer_9:
+    show:"Outer catch (Test 9) got: %{e_outer_9}":
+finally:
+    show:"Outer finally (Test 9)":
+end:
+show:"After nested try-catch (Test 9)":
+
+show:"-- Test 10: Raise within a function, caught outside --":
+funct: func_that_raises(val):
+    show:"Inside func_that_raises with %{val}":
+    if: val < 0:
+        raise: "Negative value error from function":
+    end:
+    return: "Function success":
+end:
+
+try:
+    show:"Calling func_that_raises with 5":
+    show: func_that_raises(5):
+    show:"Calling func_that_raises with -1":
+    show: func_that_raises(-1):
+    show:"This should not print (Test 10 after error call)":
+catch as e_10:
+    show:"Caught in Test 10: %{e_10}":
+end:
+show:"After function raise test (Test 10)":
+
+show:"-- Test 11: Raise within a function, caught inside the function --":
+funct: func_catches_own_error(val):
+    show:"Inside func_catches_own_error with %{val}":
+    try:
+        if: val == 0:
+            raise: "Zero value error (caught by self)":
+        end:
+        show:"Func: try succeeded for %{val}":
+        return: "Func try success":
+    catch as e_func_11:
+        show:"Func: caught its own error: %{e_func_11}":
+        return: "Func caught error":
+    finally:
+        show:"Func: finally executed for %{val}":
+    end:
+end:
+
+show: func_catches_own_error(10):
+show: func_catches_own_error(0):
+show:"After function self-catch test (Test 11)":
+
+show:"-- Test 12: Finally with return in try --":
+funct: finally_with_return_in_try():
+    try:
+        show:"Try block (Test 12) - about to return":
+        return: "Returned from try (Test 12)":
+    finally:
+        show:"Finally executed (Test 12) despite return in try":
+    end:
+    show:"This should not print (Test 12 after try-finally)":
+end:
+show: finally_with_return_in_try():
+
+show:"-- Test 13: Finally with return in catch --":
+funct: finally_with_return_in_catch():
+    try:
+        show:"Try block (Test 13) - raising error":
+        raise: "Error for Test 13 catch":
+    catch as e_13:
+        show:"Catch block (Test 13) got: %{e_13} - about to return":
+        return: "Returned from catch (Test 13)":
+    finally:
+        show:"Finally executed (Test 13) despite return in catch":
+    end:
+    show:"This should not print (Test 13 after try-catch-finally)":
+end:
+show: finally_with_return_in_catch():
+
+show:"-- Test 14: Loop with break and finally --":
+try:
+    loop: for i from 1 to 5:
+        show:"Loop (Test 14) i = %{i}":
+        if: i == 3:
+            show:"Breaking loop (Test 14)":
+            break:
+        end:
+    end:
+    show:"After loop (Test 14)":
+finally:
+    show:"Finally after loop (Test 14)":
+end:
+
+show:"--- End of Error Handling Tests ---":

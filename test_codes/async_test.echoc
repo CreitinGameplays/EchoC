@@ -1,0 +1,211 @@
+show:"--- async_test.echoc starting ---":
+
+-- Synchronous Helper Functions --
+funct: generate_initial_data(count):
+    show:"SYNC: Generating %{count} initial data items.":
+    let: data_list = []:
+    loop: for i from 1 to count:
+        data_list.append({"id": i, "value": "item_%{i}", "status": "pending"}):
+    end:
+    return: data_list:
+end:
+
+funct: format_report(processed_items, errors):
+    show:"SYNC: Formatting report. Processed: %{processed_items.len}, Errors: %{errors.len}":
+    let: report_str = "--- Processing Report ---\n":
+    report_str = report_str + "Successfully processed %{processed_items.len} items:\n":
+    loop: for item in processed_items:
+        report_str = report_str + "  - ID: %{item["id"]}, Result: %{item["result"]}\n":
+    end:
+    if: errors.len > 0:
+        report_str = report_str + "Encountered %{errors.len} errors:\n":
+        loop: for err in errors:
+            report_str = report_str + "  - Item ID: %{err["id"]}, Error: %{err["error_message"]}\n":
+        end:
+    else:
+        report_str = report_str + "No errors encountered.\n":
+    end:
+    report_str = report_str + "--- End of Report ---":
+    return: report_str:
+end:
+
+-- Asynchronous Helper Functions --
+async funct: simulate_io_delay(operation_name, duration_ms):
+    show:"ASYNC: Starting IO delay for '%{operation_name}' (%{duration_ms}ms)...":
+    -- In a real implementation, this would be a non-blocking sleep. --
+    -- For testing, we use a busy loop. --
+    -- await async_sleep(duration_ms / 1000.0): Assuming async_sleep takes seconds --
+    let: i = 0:
+    let: target_iterations = duration_ms * 1000: -- Adjust multiplier for desired delay --
+    loop: while i < target_iterations:
+        let: i = i + 1:
+    end:
+    show:"ASYNC: ...Finished IO delay for '%{operation_name}' (%{duration_ms}ms).":
+    return: "%{operation_name} completed after %{duration_ms}ms":
+end:
+
+async funct: fetch_resource_data(resource_id, fail_on_id):
+    show:"ASYNC: Attempting to fetch resource '%{resource_id}'...":
+    await simulate_io_delay("fetch_resource_%{resource_id}", 150): -- Simulate network latency --
+    if: resource_id == fail_on_id:
+        show:"ASYNC: ...Fetch FAILED for resource '%{resource_id}' (simulated error).":
+        raise: "Simulated network error for resource %{resource_id}":
+    end:
+    let: data_payload = {
+        "id": resource_id,
+        "content": "Content for resource %{resource_id}",
+        "timestamp": "2023-10-27T10:00:00Z",
+        "metadata": ["tag1", "tag2", resource_id % 2 == 0 ? "even_tag" : "odd_tag"]
+    }:
+    show:"ASYNC: ...Successfully fetched resource '%{resource_id}'.":
+    return: data_payload:
+end:
+
+async funct: process_data_item(item_data, processing_complexity):
+    show:"ASYNC: Processing item ID '%{item_data["id"]}' with complexity %{processing_complexity}...":
+    let: delay_ms = 50 + (processing_complexity * 20):
+    await simulate_io_delay("process_item_%{item_data["id"]}", delay_ms):
+
+    let: result_dict = {"original_id": item_data["id"], "status": "processed"}:
+    if: item_data["id"] % 4 == 0: -- Simulate a processing failure for some items
+        show:"ASYNC: ...Processing FAILED for item ID '%{item_data["id"]}' (simulated internal error).":
+        let: result_dict["status"] = "error":
+        let: result_dict["error_detail"] = "Simulated processing failure.":
+    elif: processing_complexity > 2:
+        let: result_dict["detail"] = "Complex processing successful. Value: %{item_data["value"] * 2}":
+        let: result_dict["value_length"] = item_data["value"].len:
+    else:
+        let: result_dict["detail"] = "Simple processing successful.":
+        let: result_dict["value_length"] = item_data["value"].len + 5:
+    end:
+
+    show:"ASYNC: ...Finished processing item ID '%{item_data["id"]}'. Status: %{result_dict["status"]}":
+    return: result_dict:
+end:
+
+-- Main Asynchronous Orchestrator --
+async funct: main_async_workflow():
+    show:"--- ASYNC WORKFLOW STARTED ---":
+
+    let: initial_items = generate_initial_data(5): -- Sync call --
+    show:"Initial items: %{initial_items}":
+
+    let: setup_message = await simulate_io_delay("system_setup", 100): -- Await simple async --
+    show: setup_message:
+
+    let: processed_results = []:
+    let: error_log = []:
+    let: iteration_count = 0:
+
+    show:"--- Starting main processing loop ---":
+    loop: while iteration_count < initial_items.len:
+        let: current_item = initial_items[iteration_count]:
+        show:"LOOP Iteration %{iteration_count + 1}: Processing item ID '%{current_item['id']}'":
+
+        try:
+            if: iteration_count % 3 == 0: -- Every 3rd iteration, try fetching extra resources concurrently --
+                show:"LOOP: Special handling for iteration %{iteration_count + 1} - fetching extra resources.":
+                let: resource_task1 = fetch_resource_data("extra_A_%{current_item['id']}", "extra_A_3"): -- ID 3 will fail for resource_task1 --
+                let: resource_task2 = fetch_resource_data("extra_B_%{current_item['id']}", "non_existent_fail_id"):
+                
+                show:"LOOP: Gathering extra resources...":
+                let: extra_resources = await gather([resource_task1, resource_task2]):
+                show:"LOOP: Extra resources gathered. Count: %{extra_resources.len}":
+                
+                -- Process gathered resources (example) --
+                let: res_idx = 0:
+                loop: while res_idx < extra_resources.len:
+                    let: res_data = extra_resources[res_idx]:
+                    if: res_data.type == VAL_STRING and res_data.as.string_val.slice(0,5) == "Error": -- Crude error check for gather result  TODO: Make this more robust if type info is available directly --
+                        show:"LOOP: Gathered resource %{res_idx + 1} had an error: %{res_data}"                            :
+                        error_log.append({"id": "extra_resource_%{res_idx}", "error_message": res_data}):
+                    elif: res_data.type == VAL_DICT:
+                        show:"LOOP: Gathered resource %{res_idx + 1} data: %{res_data["content"]}":
+                        let: current_item["extra_info_%{res_idx}"] = res_data["metadata"]:
+                    else:
+                        show:"LOOP: Gathered resource %{res_idx + 1} has unexpected type: %{res_data.type}"                            :
+                    end:
+                    let: res_idx = res_idx + 1:
+                end:
+                let: item_process_complexity = 3: -- Higher complexity after fetching extra resources --
+                let: processing_result = await process_data_item(current_item, item_process_complexity):
+                if: processing_result["status"] == "processed":
+                    processed_results.append(processing_result):
+                else:
+                    error_log.append({"id": current_item["id"], "error_message": processing_result["error_detail"]}):
+                end:
+
+            elif: iteration_count % 2 == 0: -- Even iterations (but not divisible by 3)
+                show:"LOOP: Standard processing for item ID '%{current_item['id']}'":
+                let: fetched_single_resource = await fetch_resource_data("main_%{current_item['id']}", "main_4"): -- ID 4 will fail --
+                show:"LOOP: Main resource for item ID '%{current_item['id']}': %{fetched_single_resource['content']}":
+                let: current_item['main_content_length'] = fetched_single_resource['content'].len:
+                
+                let: item_process_complexity = 1:
+                let: processing_result = await process_data_item(current_item, item_process_complexity):
+                if: processing_result["status"] == "processed":
+                    processed_results.append(processing_result):
+                else:
+                    error_log.append({"id": current_item['id'], "error_message": processing_result["error_detail"]}):
+                end:
+            else: -- Odd iterations (but not divisible by 3)
+                show:"LOOP: Quick processing for item ID '%{current_item['id']}'":
+                await simulate_io_delay("quick_op_item_%{current_item["id"]}", 30):
+                let: current_item['status'] = "quick_processed":
+                let: current_item['quick_detail'] = "Performed quick operation. Value: %{current_item['value'] + \"_quick\"}":
+                processed_results.append(current_item):
+            end:
+        catch as e:
+            show:"LOOP: EXCEPTION CAUGHT for item ID '%{current_item['id']}': %{e}":
+            error_log.append({"id": current_item['id'], "error_message": e}):
+        finally:
+            show:"LOOP: Finally block for item ID '%{current_item['id']}' in iteration %{iteration_count + 1}.":
+        end:
+
+        let: iteration_count = iteration_count + 1:
+        if: iteration_count == 3: -- Test break
+            show:"LOOP: Reached iteration 3, breaking loop for demonstration.":
+            break:
+        end:
+        -- No continue example here, but it would skip to the next `loop: while` check --
+    end:
+    show:"--- Main processing loop finished ---":
+
+    show:"--- Starting final batch of concurrent tasks ---":
+    let: final_task_ids = ["final_alpha", "final_beta", "final_gamma_FAIL", "final_delta"]:
+    let: final_tasks_to_run = -- i can comment here -- []:
+    loop: for task_id_str in final_task_ids:
+        -- Create coroutine objects, don't await them yet for gather
+        let: fail_id_for_fetch = (task_id_str == "final_gamma_FAIL" ? "final_gamma_FAIL" : "no_fail_expected"):
+        let: task_coro = fetch_resource_data(task_id_str, fail_id_for_fetch)        :
+        final_tasks_to_run.append(task_coro):
+    end:
+    
+    show:"Final tasks created. Gathering all %{final_tasks_to_run.len} final tasks...":
+    let: final_gathered_results = await gather(final_tasks_to_run):
+    show:"--- Final batch tasks gathered ---":
+
+    loop: for i from 0 to final_gathered_results.len - 1:
+        let: res = final_gathered_results[i]:
+        if: res.type == VAL_STRING and res.as.string_val.slice(0,5) == "Error":
+            show:"Final Task %{i} Result (Error): %{res}":
+            error_log.append({"id": final_task_ids[i], "error_message": res}):
+        elif: res.type == VAL_DICT:
+            show:"Final Task %{i} Result (Success for '%{res["id"]}'): %{res["content"].slice(0,20)}...":
+            processed_results.append({"id": res["id"], "result": "Final task success", "content_preview": res["content"].slice(0,10)}):
+        else:
+            show:"Final Task %{i} Result (Unknown type): %{res}":
+        end:
+    end:
+
+    let: final_report = format_report(processed_results, error_log): -- Sync call --
+    show: final_report:
+
+    show:"--- ASYNC WORKFLOW FINISHED ---":
+    return: "Workflow completed. Processed: %{processed_results.len}, Errors: %{error_log.len}":
+end:
+
+-- Run the main async workflow --
+run: main_async_workflow():
+
+show:"--- async_test.echoc finished ---":

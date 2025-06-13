@@ -1,0 +1,58 @@
+show:"--- temp.echoc starting ---":
+
+-- Load sqrt module --
+load: (binary_search_sqrt as bss) from "/home/creitin/EchoC/src_c/echoc_features/sqrt":
+show:"--- sqrt module loaded, using bss ---":
+
+-- Load complex module_test (assuming module_test.ecc is in the same directory as temp.echoc or found via ECHOC_PATH) --
+show:"--- Attempting to load module_test.ecc ---":
+load: (simple_module_func as smf, TestBlueprint as TB, ComplexBlueprint as CB, module_global_var as mgv, func_using_global as fug, another_module_var) from "module_test": -- Added ComplexBlueprint --
+load: module_test as module_test_ns:
+show:"--- module_test.ecc loaded selectively and as namespace ---":
+
+show:"--- Testing sqrt ---":
+let: num_sqrt = 64:
+let: result_sqrt = bss(num_sqrt):
+show:"Square root of %{num_sqrt} is %{result_sqrt}":
+
+show:"--- Testing selectively imported items from module_test ---":
+show: "Calling smf(): %{smf()}":
+show: "Accessing mgv: %{mgv}":
+show: "Accessing another_module_var directly: %{another_module_var}":
+show: "Calling fug(): %{fug()}":
+
+let: tb_instance1 = TB("InstanceOne"):
+show: "tb_instance1.get_info(): %{tb_instance1.get_info()}":
+show: "Accessing TB.bp_class_attr: %{TB.bp_class_attr}":
+show: "Calling TB.static_like_method(): %{TB.static_like_method()}":
+
+'''
+nothing here
+alright
+'''
+
+show:"--- Testing items via module_test_ns namespace ---":
+show: "Calling module_test_ns.func_using_global(): %{module_test_ns.func_using_global()}":
+show: "Accessing module_test_ns.module_global_var: %{module_test_ns.module_global_var}":
+show: "Accessing module_test_ns.another_module_var: %{module_test_ns.another_module_var}":
+
+let: tb_instance2 = module_test_ns.TestBlueprint("InstanceTwoViaNS"):
+show: "tb_instance2.get_info(): %{tb_instance2.get_info()}":
+show: "Accessing module_test_ns.TestBlueprint.bp_class_attr: %{module_test_ns.TestBlueprint.bp_class_attr}":
+show: "Calling module_test_ns.TestBlueprint.static_like_method(): %{module_test_ns.TestBlueprint.static_like_method()}":
+
+show:"--- Testing ComplexBlueprint from module_test ---":
+let: cb_instance = CB("MyComplexInstance"): -- Expected: ComplexBlueprint 'MyComplexInstance' initialized. ID: ComplexBP_v1 --
+show: cb_instance.get_status(): -- Expected: Status of 'MyComplexInstance': initialized. Log count: 0 (or 1 if init logs) --
+
+show:"Processing with input 12 (large):":
+let: result_large = cb_instance.process_data(12):
+show:"Result from process_data(12): %{result_large}":
+show: cb_instance.get_status():
+
+show:"Processing with input 5 (small):":
+let: result_small = cb_instance.process_data(5):
+show:"Result from process_data(5): %{result_small}":
+show: cb_instance.get_status():
+
+show:"--- temp.echoc finished ---":

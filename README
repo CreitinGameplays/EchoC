@@ -1,0 +1,8 @@
+# EchoC is a Python-inspired programming language written and compiled with C!
+
+
+Debug errors with valgrind/heapusage:
+```
+valgrind -s --leak-check=full --track-origins=yes --show-leak-kinds=all ./EchoC temp.echoc
+heapusage ./EchoC test_codes/async_test.echocC
+```
