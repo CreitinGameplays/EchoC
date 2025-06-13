@@ -215,8 +215,6 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
             if (id_val_ptr && id_val_ptr->type == VAL_BLUEPRINT) {
                 // Instance creation: Dog(arg1, arg2)
                 // interpret_instance_creation uses id_token_for_reporting for context, does not free it.
-                free(id_name); // Free the strdup'd name
-                free_token(id_token_for_reporting); // Free the deep-copied token
                 expr_res.value = interpret_instance_creation(interpreter, id_val_ptr->as.blueprint_val, id_token_for_reporting);
                 if (expr_res.value.type == VAL_OBJECT) expr_res.is_freshly_created_container = true;
                 expr_res.is_standalone_primary_id = false; // Instance creation is an operation
@@ -225,13 +223,15 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
                 // interpret_any_function_call uses id_name for lookup and id_token_for_reporting for errors.
                 // It does not free them.
                 expr_res.value = interpret_any_function_call(interpreter, id_name, id_token_for_reporting, NULL);
-                // If the result is a coroutine, it's a fresh container.
-                if (expr_res.value.type == VAL_COROUTINE || expr_res.value.type == VAL_GATHER_TASK) {
+                // Result of a function call is considered new/temporary if it's a container type.
+                if (expr_res.value.type == VAL_OBJECT ||
+                    expr_res.value.type == VAL_ARRAY ||
+                    expr_res.value.type == VAL_DICT ||
+                    expr_res.value.type == VAL_STRING ||
+                    expr_res.value.type == VAL_TUPLE || // Added VAL_TUPLE
+                    expr_res.value.type == VAL_COROUTINE || // Coroutines are also fresh
+                    expr_res.value.type == VAL_GATHER_TASK) { // Gather tasks are fresh
                      expr_res.is_freshly_created_container = true;
-                }
-                // Result of a function call is considered new/temporary if it's a container
-                if (expr_res.value.type == VAL_OBJECT || expr_res.value.type == VAL_ARRAY || expr_res.value.type == VAL_DICT || expr_res.value.type == VAL_STRING) {
-                    expr_res.is_freshly_created_container = true;
                 } else {
                     expr_res.is_freshly_created_container = false;
                 }
@@ -615,22 +615,36 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                     next_derived_value.as.string_val = strdup(bp->name);
                     if (!next_derived_value.as.string_val) {
                         free(attr_name);
-                        report_error("System", "Failed to strdup blueprint name for .name access", dot_token);
+                        report_error("System", "Failed to strdup blueprint name for .name access", dot_token); // dot_token will be freed by caller or error handler
                         free_token(dot_token);
                     }
                     // No need to set attribute_handled_by_special_case here as it's the end of VAL_BLUEPRINT specific logic for "name"
                     next_derived_is_fresh = true; // New string
                 } else { // Regular class attribute/static method
-                    Value* class_attr_ptr = symbol_table_get_local(bp->class_attributes_and_methods, attr_name);
+                    Value* class_attr_ptr = NULL;
+                    Blueprint* search_bp_hierarchy = bp; // Start with the current blueprint
+                    while (search_bp_hierarchy) {
+                        class_attr_ptr = symbol_table_get_local(search_bp_hierarchy->class_attributes_and_methods, attr_name);
+                        if (class_attr_ptr) break; // Found
+                        search_bp_hierarchy = search_bp_hierarchy->parent_blueprint; // Go to parent
+                    }
+
                     if (!class_attr_ptr) {
                         char err_msg[150];
-                        sprintf(err_msg, "Blueprint '%s' has no class attribute or static method '%s'.", bp->name, attr_name);
+                        sprintf(err_msg, "Blueprint '%s' (and its parents) has no class attribute or static method '%s'.", bp->name, attr_name);
                         free(attr_name); if(result_is_freshly_created) free_value_contents(result);
                         report_error("Runtime", err_msg, dot_token);
                         free_token(dot_token);
                     }
                     next_derived_value = value_deep_copy(*class_attr_ptr);
-                    next_derived_is_fresh = true; // Deep copy is fresh
+                    // Mark as fresh if it's a container type that value_deep_copy creates anew
+                    if (next_derived_value.type == VAL_STRING || next_derived_value.type == VAL_ARRAY ||
+                        next_derived_value.type == VAL_DICT || next_derived_value.type == VAL_TUPLE ||
+                        next_derived_value.type == VAL_OBJECT) {
+                        next_derived_is_fresh = true;
+                    } else {
+                        next_derived_is_fresh = false;
+                    }
                 }
             } else if (result.type == VAL_ARRAY) {
                 if (strcmp(attr_name, "append") == 0) {
@@ -1523,7 +1537,7 @@ ExprResult interpret_await_expr(Interpreter* interpreter) {
         pending_res.is_standalone_primary_id = false;
         return pending_res;
     }
-    return interpret_logical_or_expr(interpreter); // Not an await, continue parsing
+    return interpret_ternary_expr(interpreter); // Not an await, parse ternary (next lowest precedence)
 }
 
 static void coroutine_add_waiter(Coroutine* self, Coroutine* waiter_coro_to_add) {
