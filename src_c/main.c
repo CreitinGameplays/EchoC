@@ -223,10 +223,12 @@ Value value_deep_copy(Value original) {
             } else { new_func->params[i].default_value = NULL; }
         }
         new_func->body_start_state = original_func->body_start_state; // Copy struct
-        // body_start_state.text should point to new_func->source_text_owned_copy after it's set.
         new_func->body_end_token_original_line = original_func->body_end_token_original_line;
         new_func->body_end_token_original_col = original_func->body_end_token_original_col;
         new_func->definition_scope = original_func->definition_scope; // Share the definition scope
+        // The original_func (from symbol table or another Value) already owns its source_text_owned_copy.
+        // The new_func (the copy being made) must also get its own owned copy.
+
 
         // The original_func (from symbol table or another Value) already owns its source_text_owned_copy.
         // The new_func (the copy being made) must also get its own owned copy.
@@ -237,6 +239,10 @@ Value value_deep_copy(Value original) {
             new_func->source_text_owned_copy = NULL; // Should not happen if always set
         }
         new_func->source_text_length = original_func->source_text_length; // Copy length
+        // CRITICAL: Update the copied body_start_state to use the new_func's owned text
+        if (new_func->source_text_owned_copy) {
+            new_func->body_start_state.text = new_func->source_text_owned_copy;
+        }
         new_func->is_async = original_func->is_async; // <-- FIX: Copy the is_async flag
         new_func->is_source_owner = (new_func->source_text_owned_copy != NULL); // The copy owns its strdup'd text
         copy.as.function_val = new_func;
