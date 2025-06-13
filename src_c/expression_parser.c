@@ -1060,6 +1060,13 @@ Value execute_echoc_function(Interpreter* interpreter, Function* func_to_call, O
 
     interpreter->function_nesting_level--;
     Value result = value_deep_copy(interpreter->current_function_return_value);
+    
+    // Free the contents of the interpreter's return value slot,
+    // as 'result' now holds the (copied) value to be returned.
+    // The original current_function_return_value might have been a temporary
+    // created by the 'return' statement's expression.
+    free_value_contents(interpreter->current_function_return_value);
+    interpreter->current_function_return_value = create_null_value(); // Reset for safety
 
     set_lexer_state(interpreter->lexer, old_lexer_state);
     free_token(interpreter->current_token);
