@@ -1,1 +1,7 @@
 /.vscode
+aggregated_src_c_files.txt
+save_src.py
+echoc_runtime_log.txt
+temp.echoc
+remove_end_tokens.py
+.aiexclude

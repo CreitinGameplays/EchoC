@@ -4,7 +4,10 @@
 
 #include "../header.h" // To get Value, Interpreter, Token, report_error definitions
 
-// Forward declare built-in functions
+// Built-in for show()
+Value builtin_show(Interpreter* interpreter, ParsedArgument* args, int arg_count, Token* call_site_token);
+
+// Built-in for slice()
 Value builtin_slice(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token);
 
 // builtin for .len support
@@ -13,10 +16,8 @@ Value builtin_len(Interpreter* interpreter, Value* args, int arg_count, Token* c
 // Add built-in for .append (for array-type values)
 Value builtin_append(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token);
 
-// Async built-ins
-Value builtin_async_sleep_create_coro(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token);
-Value builtin_gather_create_coro(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token);
-Value builtin_cancel_coro(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token);
+// Built-in for type()
+Value builtin_type(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token);
 
 // Add other built-in function declarations here as they are created
 // e.g. Value builtin_to_upper(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token);

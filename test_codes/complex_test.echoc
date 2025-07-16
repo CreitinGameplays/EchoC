@@ -1,0 +1,638 @@
+-- EchoC Comprehensive & Complex Test Suite --
+load: weaver as yourmom:
+
+show("--- Test Suite Start ---"):
+
+show("--- Comments and Basic I/O ---"):
+-- This is an inline comment --
+let:test_var_1 = "Hello from EchoC!":
+show(test_var_1): -- Expected: Hello from EchoC! --
+
+'''This is a
+    multiline block comment.
+    let:hidden_in_comment = 123:
+    show(hidden_in_comment) -- This should not appear --
+'''
+-- sus --
+'''
+This is a
+another multiline block comment.
+    let:hidden_in_comment = 123:
+    show(hidden_in_comment) -- This also should not appear --
+'''
+show("After the block comments."): -- Expected: After block comment. --
+
+show("--- Variables and Data Types ---"):
+let:my_integer = 42:
+let:my_float = 3.14159:
+let:my_string = "EchoC is fun!":
+let:my_boolean_true = true:
+let:my_boolean_false = false:
+let:my_null_val = null: -- Assuming 'null' keyword or implicit null for uninitialized if supported, else this might error or be specific value --
+
+show(my_integer): -- Expected: 42 --
+show(my_float):   -- Expected: 3.14159 --
+show(my_string):  -- Expected: EchoC is fun! --
+show(my_boolean_true):  -- Expected: true --
+show(my_boolean_false): -- Expected: false --
+show(my_null_val):      -- Expected: null (or language's representation) --
+
+show("--- String Interpolation & Multiline Strings ---"):
+let:user = "Tester":
+let:score = 100:
+show("User: %{user}, Score: %{score}"): -- Expected: User: Tester, Score: 100 --
+
+let:multi_line_str = """
+This is a
+  multi-line string.
+    With %{user} and score %{score}.
+""":
+show(multi_line_str): -- Expected: (multiline output with interpolation) --
+
+show("--- Arithmetic Operations ---"):
+show(10 + 5 * 2):  -- Expected: 20 (Order of operations) --
+show((10 + 5) * 2): -- Expected: 30 --
+show(10 / 4):      -- Expected: 2.5 (Float division) --
+show(7 - 3 + 1):   -- Expected: 5 --
+show(2 ^ 3 ^ 2):   -- Expected: 512 (2^(3^2) = 2^9) --
+show((2 ^ 3) ^ 2): -- Expected: 64 ((2^3)^2 = 8^2) --
+show(-5 + 2):      -- Expected: -3 --
+show("String " + "concat" + " works: " + (10 + 5)): -- Expected: String concat works: 15 --
+show("Repeat" * 3): -- Expected: RepeatRepeatRepeat --
+
+show("--- Comparison and Logical Operations ---"):
+show((5 > 3) and (10 <= 20)): -- Expected: true --
+show((5 < 3) or not (false)): -- Expected: true --
+show(10 == 10.0):             -- Expected: true --
+show("abc" != "def"):         -- Expected: true --
+show(true == (10 > 5)):       -- Expected: true --
+show(false or (true and false)): -- Expected: false --
+
+show("--- Ternary Operator ---"):
+let:val_a = 10:
+let:val_b = 20:
+show("A is greater" if val_a > val_b else "B is greater or equal"): -- Expected: B is greater or equal --
+show(("Both correct" if val_b == 20 else "B wrong") if val_a == 10 else "A wrong"): -- Expected: Both correct --
+
+show("--- Array Operations ---"):
+let:numbers_arr = [1, 2, 3, 4, 5]:
+show(numbers_arr[0]): -- Expected: 1 --
+show(numbers_arr[-1]): -- Expected: 5 --
+let:numbers_arr[2] = 30:
+show(numbers_arr): -- Expected: [1, 2, 30, 4, 5] --
+let:nested_arr = [10, [20, "str_in_arr"], 30]:
+show(nested_arr[1][1]): -- Expected: str_in_arr --
+let:nested_arr[1][0] = 200:
+show(nested_arr): -- Expected: [10, [200, str_in_arr], 30] --
+
+show("--- Tuple Operations ---"):
+let:my_tuple_val = (10, "tuple_str", true, [1,2]):
+show(my_tuple_val[1]): -- Expected: tuple_str --
+show(my_tuple_val[-1][0]): -- Expected: 1 --
+-- Tuples are immutable, so modification attempts should fail if checked by language --
+-- let:my_tuple_val[0] = 100: This should cause a runtime error if tuples are truly immutable --
+
+show("--- Dictionary Operations ---"):
+let:my_dict_val = {"name": "EchoLang", "version": 0.2, "features": ["arrays", "loops"]}:
+show(my_dict_val["name"]): -- Expected: EchoLang --
+show(my_dict_val["features"][0]): -- Expected: arrays --
+let:my_dict_val["version"] = 0.3:
+show(my_dict_val["version"]): -- Expected: 0.3 --
+let:my_dict_val["new_key"] = {"nested_dict_key": "val"}:
+show(my_dict_val["new_key"]["nested_dict_key"]): -- Expected: val --
+
+show("--- Scope Tests ---"):
+let:global_var = "I am global":
+{
+    show(global_var): -- Expected: I am global --
+    let:global_var = "Shadowed global in block":
+    let:block_local = "I am block local":
+    show(global_var): -- Expected: Shadowed global in block --
+    show(block_local): -- Expected: I am block local --
+}
+show(global_var): -- Expected: Shadowed global in block --
+-- show:block_local: This would be an error: Undefined variable 'block_local' --
+
+show("--- If/Elif/Else Control Flow ---"):
+let:control_flow_val = 75:
+if: control_flow_val > 90:
+    show("Grade A"):
+elif: control_flow_val > 80:
+    show("Grade B"):
+elif: control_flow_val > 70:
+    show("Grade C"): -- Expected: Grade C --
+    if: control_flow_val == 75:
+        show("Exactly 75!"): -- Expected: Exactly 75! --
+else:
+    show("Grade D or F"):
+
+if: false:
+    show("This should not print (if false)"):
+elif: false:
+    show("This should not print (elif false)"):
+else:
+    show("Else branch taken."): -- Expected: Else branch taken. --
+
+
+show("--- Loop Control Flow ---"):
+show("-- While Loop --"):
+let:while_counter = 3:
+loop: while while_counter > 0:
+    show("While count: %{while_counter}"):
+    let:while_counter = while_counter - 1:
+
+-- Expected: While count: 3, While count: 2, While count: 1 --
+
+show("-- For...From...To...Step Loop --"):
+loop: for i from 10 to 0 step -2:
+    show("For countdown: %{i}"):
+
+-- Expected: For countdown: 10, 8, 6, 4, 2, 0 --
+
+show("-- For...In Loop (Array) --"):
+let:items_to_loop = ["alpha", "beta", "gamma"]:
+loop: for item_name in items_to_loop:
+    show("Item: %{item_name}"):
+
+-- Expected: Item: alpha, Item: beta, Item: gamma --
+
+show("-- For...In Loop (String) --"):
+loop: for char_item in "XYZ":
+    show("Char: %{char_item}"):
+
+-- Expected: Char: X, Char: Y, Char: Z --
+
+show("-- For...In Loop (Dictionary Keys) --"):
+let:dict_loop_data = {"one": 1, "two": 2}:
+let:keys_found = "":
+loop: for k in dict_loop_data:
+    let:keys_found = keys_found + k + " ":
+
+show("Keys from dict loop: %{keys_found}"): -- Expected: Keys from dict loop: one two  (or two one ) --
+
+show("-- Loop with Break and Continue --"):
+let:loop_control_output = "":
+loop: for num_val from 1 to 10:
+    if: num_val % 2 == 0: -- Even numbers --
+        continue:
+    
+    if: num_val == 7:
+        let:loop_control_output = loop_control_output + "Break@%{num_val}":
+        break:
+    
+    let:loop_control_output = loop_control_output + "%{num_val},":
+
+show(loop_control_output): -- Expected: 1,3,5,Break@7 --
+
+show("--- Function Definition and Calls ---"):
+funct: simple_func():
+    show("Inside simple_func"):
+    return: "Returned from simple_func":
+
+let:sf_result = simple_func():
+show(sf_result): -- Expected: Returned from simple_func --
+
+funct: func_with_params(name, age, city="Unknown"):
+    show("Name: %{name}, Age: %{age}, City: %{city}"):
+    return: age >= 18:
+
+show(func_with_params("Alice", 30)): -- Expected: Name: Alice, Age: 30, City: Unknown --
+show(func_with_params("Bob", 16, "Metropolis")): -- Expected: Name: Bob, Age: 16, City: Metropolis --
+
+
+show("-- Function Scope and Recursion --"):
+let:recursion_global = "Global for recursion":
+funct: factorial_recursive(n):
+    show("Factorial call for n=%{n}, global is: %{recursion_global}"):
+    let:recursion_global = "Local in factorial n=%{n}": -- Shadowing --
+    show("Factorial call for n=%{n}, local global is: %{recursion_global}"):
+    if: n <= 1:
+        return: 1:
+    
+    return: n * factorial_recursive(n - 1):
+
+show(factorial_recursive(3)):
+-- Expected: (Factorial call logs for 3, 2, 1 with shadowing) --
+-- Expected: 6 --
+show("After factorial, global is: %{recursion_global}"): -- Expected: After factorial, global is: Local in factorial n=1 --
+
+show("--- Error Handling Tests (try-catch-finally) ---"):
+
+show("-- Test 1: Simple try-catch for a raise --"):
+try:
+    show("Inside try (Test 1)"):
+    raise: "Error in Test 1":
+    show("This should not print (Test 1 after raise)"):
+catch:
+    show("Caught an error (Test 1)"):
+
+show("After try-catch (Test 1)"):
+-- Expected: Inside try (Test 1), Caught an error (Test 1), After try-catch (Test 1) --
+
+show("-- Test 2: try-catch as e and print e --"):
+try:
+    show("Inside try (Test 2)"):
+    raise: "Custom Error Message 2":
+catch as err_obj:
+    show("Caught error (Test 2): %{err_obj}"):
+
+show("After try-catch as e (Test 2)"):
+-- Expected: Inside try (Test 2), Caught error (Test 2): Custom Error Message 2, After try-catch as e (Test 2) --
+
+show("-- Test 3: try-finally where try succeeds --"):
+try:
+    show("Inside try (Test 3) - success"):
+finally:
+    show("Finally block executed (Test 3)"):
+
+show("After try-finally (Test 3)"):
+-- Expected: Inside try (Test 3) - success, Finally block executed (Test 3), After try-finally (Test 3) --
+
+show("-- Test 4: try-finally where try raises (uncaught by this try) --"):
+try: -- Outer try to catch the error --
+    try:
+        show("Inside inner try (Test 4)"):
+        raise: "Error in Test 4 to show finally":
+    finally:
+        show("Inner Finally block executed (Test 4)"):
+    
+    show("This should not print (Test 4 after inner try-finally)"):
+catch as e_outer_4:
+    show("Outer catch (Test 4) caught: %{e_outer_4}"):
+
+show("After try-finally with raise (Test 4)"):
+-- Expected: Inside inner try (Test 4), Inner Finally block executed (Test 4), Outer catch (Test 4) caught: Error in Test 4 to show finally, After try-finally with raise (Test 4) --
+
+show("-- Test 5: try-catch-finally where try succeeds --"):
+try:
+    show("Inside try (Test 5) - success"):
+catch as e5:
+    show("Catch block (Test 5) - should not run: %{e5}"):
+finally:
+    show("Finally block executed (Test 5)"):
+
+show("After try-catch-finally success (Test 5)"):
+-- Expected: Inside try (Test 5) - success, Finally block executed (Test 5), After try-catch-finally success (Test 5) --
+
+show("-- Test 6: try-catch-finally where try raises and catch handles --"):
+try:
+    show("Inside try (Test 6)"):
+    raise: "Error for Test 6":
+catch as e6:
+    show("Catch block (Test 6) handled: %{e6}"):
+finally:
+    show("Finally block executed (Test 6)"):
+
+show("After try-catch-finally handled (Test 6)"):
+-- Expected: Inside try (Test 6), Catch block (Test 6) handled: Error for Test 6, Finally block executed (Test 6), After try-catch-finally handled (Test 6) --
+
+show("-- Test 7: try raises, catch raises, finally executes --"):
+try: -- Outer try --
+    try: -- Inner try --
+        show("Inside inner try (Test 7)"):
+        raise: "Initial error (Test 7)":
+    catch as e_inner_7:
+        show("Inner catch (Test 7) got: %{e_inner_7}"):
+        raise: "Error from inner catch (Test 7)":
+    finally:
+        show("Inner finally executed (Test 7)"):
+    
+    show("This should not print (Test 7 after inner try-catch-finally)"):
+catch as e_outer_7:
+    show("Outer catch (Test 7) got: %{e_outer_7}"):
+
+show("After try-catch-raise-finally (Test 7)"):
+-- Expected: Inside inner try (Test 7), Inner catch (Test 7) got: Initial error (Test 7), Inner finally executed (Test 7), Outer catch (Test 7) got: Error from inner catch (Test 7), After try-catch-raise-finally (Test 7) --
+
+show("-- Test 8: try raises, catch handles, finally raises --"):
+try: -- Outer try --
+    try: -- Inner try --
+        show("Inside inner try (Test 8)"):
+        raise: "Initial error (Test 8)":
+    catch as e_inner_8:
+        show("Inner catch (Test 8) got: %{e_inner_8}"):
+        -- Error handled, no re-raise from catch --
+    finally:
+        show("Inner finally executed (Test 8), now raising from finally"):
+        raise: "Error from finally (Test 8)":
+    
+    show("This should not print (Test 8 after inner try-catch-finally)"):
+catch as e_outer_8:
+    show("Outer catch (Test 8) got: %{e_outer_8}"):
+
+show("After try-catch-finally-raise (Test 8)"):
+-- Expected: Inside inner try (Test 8), Inner catch (Test 8) got: Initial error (Test 8), Inner finally executed (Test 8), now raising from finally, Outer catch (Test 8) got: Error from finally (Test 8), After try-catch-finally-raise (Test 8) --
+
+show("-- Test 9: Nested try-catch blocks --"):
+try:
+    show("Outer try (Test 9)"):
+    try:
+        show("Inner try (Test 9)"):
+        raise: "Inner error (Test 9)":
+    catch as e_inner_9:
+        show("Inner catch (Test 9) got: %{e_inner_9}"):
+        raise: "Error propagated from inner catch (Test 9)":
+    -- End of inner try-catch --
+    show("This should not print (Test 9 after inner try-catch)"):
+catch as e_outer_9:
+    show("Outer catch (Test 9) got: %{e_outer_9}"):
+finally:
+    show("Outer finally (Test 9)"):
+-- End of outer try-catch-finally --
+show("After nested try-catch (Test 9)"):
+-- Expected: Outer try (Test 9), Inner try (Test 9), Inner catch (Test 9) got: Inner error (Test 9), Outer catch (Test 9) got: Error propagated from inner catch (Test 9), Outer finally (Test 9), After nested try-catch (Test 9) --
+
+show("-- Test 10: Raise within a function, caught outside --"):
+funct: func_that_raises(val):
+    show("Inside func_that_raises with %{val}"):
+    if: val < 0:
+        raise: "Negative value error from function":
+    
+    return: "Function success":
+
+
+show("Calling func_that_raises with 5"):
+show(func_that_raises(5)): -- Expected: Inside func_that_raises with 5, Function success --
+
+try:
+    show("Calling func_that_raises with -1"):
+    show(func_that_raises(-1)):
+    show("This should not print (Test 10 after func_that_raises(-1))"):
+catch as e10:
+    show("Caught in Test 10: %{e10}"):
+
+show("After function raise test (Test 10)"):
+-- Expected: Calling func_that_raises with -1, Inside func_that_raises with -1, Caught in Test 10: Negative value error from function, After function raise test (Test 10) --
+
+show("-- Test 11: Raise within a function, caught inside the function --"):
+funct: func_catches_own_error(val):
+    show("Inside func_catches_own_error with %{val}"):
+    try:
+        if: val == 0:
+            raise: "Zero value error (caught by self)":
+        
+        show("Func: try succeeded for %{val}"):
+        return: "Func try success":
+    catch as e_self_catch:
+        show("Func: caught its own error: %{e_self_catch}"):
+        return: "Func caught error":
+    finally:
+        show("Func: finally executed for %{val}"):
+    
+
+
+show(func_catches_own_error(10)):
+-- Expected: Inside func_catches_own_error with 10, Func: try succeeded for 10, Func: finally executed for 10, Func try success --
+show(func_catches_own_error(0)):
+-- Expected: Inside func_catches_own_error with 0, Func: caught its own error: Zero value error (caught by self), Func: finally executed for 0, Func caught error --
+show("After function self-catch test (Test 11)"):
+
+show("-- Test 12: Finally with return in try --"):
+funct: finally_with_return_in_try():
+    try:
+        show("Try block (Test 12) - about to return"):
+        return: "Returned from try (Test 12)": -- Expected: Returned from try (Test 12) --
+        show("This should not print (Test 12 after return in try)"):
+    finally:
+        show("Finally executed (Test 12) despite return in try"):
+    
+    show("This should not print (Test 12 after try-finally)"):
+
+show(finally_with_return_in_try()):
+-- Expected: Try block (Test 12) - about to return, Finally executed (Test 12) despite return in try, Returned from try (Test 12) --
+
+show("-- Test 13: Finally with return in catch --"):
+funct: finally_with_return_in_catch():
+    try:
+        show("Try block (Test 13) - raising error"):
+        raise: "Error for Test 13 catch":
+        show("This should not print (Test 13 after raise in try)"):
+    catch as e13:
+        show("Catch block (Test 13) got: %{e13} - about to return"):
+        return: "Returned from catch (Test 13)":
+        show("This should not print (Test 13 after return in catch)"):
+    finally:
+        show("Finally executed (Test 13) despite return in catch"):
+    
+    show("This should not print (Test 13 after try-catch-finally)"):
+
+show(finally_with_return_in_catch()):
+-- Expected: Try block (Test 13) - raising error, Catch block (Test 13) got: Error for Test 13 catch - about to return, Finally executed (Test 13) despite return in catch, Returned from catch (Test 13) --
+
+show("-- Test 14: Loop with break and finally --"):
+try:
+    loop: for i from 1 to 5:
+        show("Loop (Test 14) i = %{i}"):
+        if: i == 3:
+            show("Breaking loop (Test 14)"):
+            break:
+        
+    
+    show("After loop (Test 14)"):
+finally:
+    show("Finally after loop (Test 14)"):
+
+-- Expected: Loop (Test 14) i = 1, Loop (Test 14) i = 2, Loop (Test 14) i = 3, Breaking loop (Test 14), After loop (Test 14), Finally after loop (Test 14) --
+
+show("-- Test 15: Empty try, catch, finally blocks --"):
+try:
+    skip:
+catch:
+    skip:
+finally:
+    skip:
+
+show("After empty try-catch-finally (Test 15)"): -- Expected: After empty try-catch-finally (Test 15) --
+
+try:
+    show("Try for empty finally (Test 15b)"):
+finally:
+    skip:
+
+show("After try with empty finally (Test 15b)"):
+-- Expected: Try for empty finally (Test 15b), After try with empty finally (Test 15b) --
+
+show("--- End of Error Handling Tests ---"):
+
+show("--- OOP Tests ---"):
+
+show("-- Basic Blueprint and Instance Creation --"):
+blueprint: Greeter:
+    let: greeting_prefix = "Hello": -- Class attribute --
+
+    funct: init(self, name):
+        show("Greeter init called for %{name}"):
+        let: self.name = name: -- Instance attribute --
+    
+
+    funct: greet(self):
+        show("%{Greeter.greeting_prefix}, %{self.name}!"):
+    
+
+
+let: g1 = Greeter("World"): -- Expected: Greeter init called for World --
+g1.greet(): -- Expected: Hello, World! --
+let: g2 = Greeter("EchoC User"): -- Expected: Greeter init called for EchoC User --
+g2.greet(): -- Expected: Hello, EchoC User! --
+show(g1.name): -- Expected: World --
+show(Greeter.greeting_prefix): -- Expected: Hello --
+
+show("-- Blueprint without explicit init --"):
+blueprint: SimpleBox:
+    let: type = "Generic Box":
+
+let: box1 = SimpleBox(): -- No init, no args --
+show(box1.type): -- Expected: Generic Box (accessing class attr via instance) --
+show(SimpleBox.type): -- Expected: Generic Box --
+
+show("-- Inheritance --"):
+blueprint: Vehicle:
+    let: category = "Transportation":
+    funct: init(self, id):
+        show("Vehicle %{id} created."):
+        let: self.id = id:
+    
+    funct: identify(self):
+        show("Vehicle ID: %{self.id}, Category: %{Vehicle.category}"):
+    
+
+
+blueprint: Car inherits Vehicle:
+    let: wheels = 4: -- Car specific class attribute --
+    funct: init(self, id, model):
+        show("Car init for %{id}, model %{model}"):
+        super.init(id): -- Call parent's init --
+        let: self.model = model:
+    
+
+    -- Override identify --
+    funct: identify(self):
+        show("Car Model: %{self.model}, ID: %{self.id}, Wheels: %{Car.wheels}"):
+    
+
+    funct: drive(self):
+        show("Car %{self.model} is driving."):
+    
+
+
+let: my_car = Car("V123", "Sedan"):
+-- Expected: Car init for V123, model Sedan --
+-- Expected: Vehicle V123 created. --
+my_car.identify(): -- Expected: Car Model: Sedan, ID: V123, Wheels: 4 --
+my_car.drive():    -- Expected: Car Sedan is driving. --
+show(my_car.category): -- Expected: Transportation (inherited class attribute via instance) --
+
+show("-- Operator Overloading (op_str, op_add) --"):
+blueprint: Point:
+    funct: init(self, x, y):
+        let: self.x = x:
+        let: self.y = y:
+    
+
+    funct: op_str(self):
+        -- Custom string representation for Point objects, called by 'show:'. --
+        return: "Point(x=%{self.x}, y=%{self.y})":
+    
+
+    funct: op_add(self, other):
+        if: not (other.blueprint.name == "Point"): -- Basic type check for example --
+            raise: "Can only add Point to Point":
+        
+        return: Point(self.x + other.x, self.y + other.y):
+
+
+let: p1 = Point(1, 2):
+let: p2 = Point(10, 20):
+let: p3 = p1 + p2: -- Calls op_add --
+show(p3.x): -- Expected: 11 --
+show(p3.y): -- Expected: 22 --
+show(p1): -- Expected: Point(x=1, y=2) --
+show(p2): -- Expected: Point(x=10, y=20) --
+
+show("-- More Complex OOP: Resource Management --"):
+blueprint: Resource:
+    let: resource_category = "General Resource": -- Class attribute --
+    funct: init(self, name):
+        let: self.name = name:
+        let: self.status = "available":
+    
+    funct: get_status(self):
+        return: self.status:
+
+blueprint: ManagedResource inherits Resource:
+    let: manager_name = "SystemDaemon": -- Class attribute specific to ManagedResource --
+    funct: init(self, name, owner):
+        super.init(name): -- Call parent's init --
+        let: self.owner = owner:
+        let: self.current_user = null:
+    
+    funct: acquire(self, user):
+        if: self.status == "available":
+            let: self.status = "acquired by %{user}":
+            let: self.current_user = user:
+            return: true:
+        
+        return: false:
+    
+    funct: release(self):
+        let: self.status = "available":
+        let: self.current_user = null:
+    
+    funct: get_details(self):
+        return: "Resource '%{self.name}' (Category: %{ManagedResource.resource_category}), Owner: %{self.owner}, Status: %{self.get_status()}, Managed by: %{ManagedResource.manager_name}, Current User: %{self.current_user}":
+    
+let: res1 = ManagedResource("PrinterA", "IT_Dept"):
+show(res1.acquire("User1")): -- Expected: true --
+show(res1.get_details()):
+-- Expected: Resource 'PrinterA' (Category: General Resource), Owner: IT_Dept, Status: acquired by User1, Managed by: SystemDaemon, Current User: User1 --
+show(res1.acquire("User2")): -- Expected: false (already acquired) --
+res1.release():
+show(res1.get_details()):
+
+-- Definitions for Type Function Tests and other missing variables --
+let: t_int = 123:
+let: t_float = 123.45:
+let: t_str = "hello":
+let: t_bool = true:
+let: t_null = null:
+let: t_arr = [1, 2, 3]:
+let: t_tuple = (1, "a", true):
+let: t_dict = {"key": "value"}:
+
+funct: t_func():
+    return: 1:
+
+blueprint: t_bp:
+    funct: init(self):
+        let: self.val = 1:
+
+let: t_obj = t_bp(): -- Instantiate the blueprint --
+
+async funct: t_async_func_for_type():
+    await yourmom.rest(0.001):
+    return: "async_result":
+
+let: t_coro = t_async_func_for_type():
+let: t_gather = yourmom.gather([t_coro]):
+
+show("Type of integer: %{type(t_int)}"):         -- Expected: Type of integer: integer --
+show("Type of float: %{type(t_float)}"):         -- Expected: Type of float: float --
+show("Type of string: %{type(t_str)}"):          -- Expected: Type of string: string --
+show("Type of boolean: %{type(t_bool)}"):        -- Expected: Type of boolean: boolean --
+show("Type of null: %{type(t_null)}"):           -- Expected: Type of null: null --
+show("Type of array: %{type(t_arr)}"):           -- Expected: Type of array: array --
+show("Type of tuple: %{type(t_tuple)}"):         -- Expected: Type of tuple: tuple --
+show("Type of dictionary: %{type(t_dict)}"):     -- Expected: Type of dictionary: dictionary --
+show("Type of function: %{type(t_func)}"):       -- Expected: Type of function: function --
+show("Type of blueprint: %{type(t_bp)}"):        -- Expected: Type of blueprint: blueprint --
+show("Type of object: %{type(t_obj)}"):          -- Expected: Type of object: object --
+show("Type of coroutine: %{type(t_coro)}"):      -- Expected: Type of coroutine: coroutine --
+show("Type of gather task: %{type(t_gather)}"):  -- Expected: Type of gather task: gather_task --
+
+let: bm_test_obj_for_type = Point(1,1): -- Point blueprint is defined in OOP tests above --
+let: bm_ref_for_type = bm_test_obj_for_type.op_add:
+show("Type of bound method: %{type(bm_ref_for_type)}"): -- Expected: Type of bound method: bound_method --
+show("--- End of Type Function Tests ---"):
+
+show("--- Final Test Suite Message ---"):
+show("All complex tests concluded.", end="\n\n"): -- Expected: All complex tests concluded. --

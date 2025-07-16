@@ -1,14 +1,81 @@
 // src_c/modules/builtins.c
 #include "modules/builtins.h"
-#include "value_utils.h"
+#include "value_utils.h" // For coroutine_decref_and_free_if_zero
 #include "dictionary.h"
 #include "scope.h"
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <time.h> // For time() in async_sleep
+#include "../interpreter.h" // For add_to_ready_queue
 
 #include "../header.h"// arrays
+
+// show()
+Value builtin_show(Interpreter* interpreter, ParsedArgument* args, int arg_count, Token* call_site_token) {
+    // 1. Set default values and prepare for overrides
+    const char* sep = " ";
+    const char* end = "\n";
+    bool flush = false;
+
+    const char* sep_override = NULL;
+    const char* end_override = NULL;
+
+    // 2. Find keyword arguments and separate them from positional args
+    Value positional_args[arg_count]; // Max possible
+    int positional_arg_count = 0;
+
+    for (int i = 0; i < arg_count; i++) {
+        if (args[i].name) { // It's a keyword argument
+            if (strcmp(args[i].name, "sep") == 0) {
+                if (args[i].value.type != VAL_STRING) {
+                    report_error("Runtime", "'sep' argument for show() must be a string.", call_site_token);
+                }
+                sep_override = args[i].value.as.string_val;
+            } else if (strcmp(args[i].name, "end") == 0) {
+                if (args[i].value.type != VAL_STRING) {
+                    report_error("Runtime", "'end' argument for show() must be a string.", call_site_token);
+                }
+                end_override = args[i].value.as.string_val;
+            } else if (strcmp(args[i].name, "flush") == 0) {
+                if (args[i].value.type != VAL_BOOL) {
+                    report_error("Runtime", "'flush' argument for show() must be a boolean.", call_site_token);
+                }
+                flush = args[i].value.as.bool_val;
+            } else {
+                char err_msg[100];
+                snprintf(err_msg, sizeof(err_msg), "show() got an unexpected keyword argument '%s'", args[i].name);
+                report_error("Runtime", err_msg, call_site_token);
+            }
+        } else { // It's a positional argument
+            positional_args[positional_arg_count++] = args[i].value;
+        }
+    }
+
+    if (sep_override) sep = sep_override;
+    if (end_override) end = end_override;
+
+    // 3. Print positional arguments
+    for (int i = 0; i < positional_arg_count; i++) {
+        char* str_repr = value_to_string_representation(positional_args[i], interpreter, call_site_token);
+        debug_aware_printf("%s", str_repr);
+        free(str_repr);
+        if (i < positional_arg_count - 1) {
+            debug_aware_printf("%s", sep);
+        }
+    }
+
+    // 4. Print end string and handle flush
+    debug_aware_printf("%s", end);
+    if (flush) {
+        fflush(stdout);
+        #ifdef DEBUG_ECHOC
+        if (echoc_debug_log_file) fflush(echoc_debug_log_file);
+        #endif
+    }
+
+    return create_null_value();
+}
 
 // Placeholder for other includes if needed
 // slice()
@@ -160,138 +227,47 @@ Value builtin_append(Interpreter* interpreter, Value* args, int arg_count, Token
     return create_null_value();
 }
 
-// --- Asynchronous Built-ins ---
-
-Value builtin_async_sleep_create_coro(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token) {
-    (void)interpreter; // Not directly used for creation, but good practice for builtins
+// type()
+Value builtin_type(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token) {
+    (void)interpreter; // Interpreter context not needed here
     if (arg_count != 1) {
-        report_error("Runtime", "async_sleep() takes exactly 1 argument (duration).", call_site_token);
+        char err_msg[100];
+        snprintf(err_msg, sizeof(err_msg), "type() takes exactly 1 argument, but %d were given.", arg_count);
+        report_error("Runtime", err_msg, call_site_token);
     }
-    if (args[0].type != VAL_INT && args[0].type != VAL_FLOAT) {
-        report_error("Runtime", "async_sleep() duration must be a number.", call_site_token);
-    }
+    Value subject = args[0];
+    Value result_val;
+    result_val.type = VAL_STRING;
+    const char* type_str = NULL;
 
-    double duration_sec = (args[0].type == VAL_INT) ? (double)args[0].as.integer : args[0].as.floating;
-    if (duration_sec < 0) {
-        report_error("Runtime", "async_sleep() duration cannot be negative.", call_site_token);
-    }
-
-    Coroutine* sleep_coro = malloc(sizeof(Coroutine));
-    if (!sleep_coro) {
-        report_error("System", "Failed to allocate Coroutine for async_sleep.", call_site_token);
-    }
-
-    sleep_coro->name = strdup("async_sleep");
-    sleep_coro->function_def = NULL; // No EchoC function body
-    sleep_coro->execution_scope = NULL; // No local scope needed
-    // resume_state is not applicable for C-created coroutines like this
-    sleep_coro->state = CORO_NEW;
-    sleep_coro->result_value = create_null_value();
-    sleep_coro->exception_value = create_null_value();
-    sleep_coro->has_exception = 0;
-    sleep_coro->awaiting_on_coro = NULL;
-    sleep_coro->value_from_await = create_null_value();
-    sleep_coro->is_resumed_from_await = 0;
-    sleep_coro->wakeup_time_sec = (double)time(NULL) + duration_sec; // Using time(NULL) for seconds precision
-    sleep_coro->gather_tasks = NULL;
-    sleep_coro->gather_results = NULL;
-    sleep_coro->gather_pending_count = 0;
-    sleep_coro->gather_first_exception_idx = -1;
-    sleep_coro->parent_gather_coro = NULL;
-    sleep_coro->is_cancelled = 0;
-    sleep_coro->ref_count = 1;
-    sleep_coro->waiters_head = NULL;
-
-    Value coro_val;
-    coro_val.type = VAL_COROUTINE;
-    coro_val.as.coroutine_val = sleep_coro;
-    return coro_val;
-}
-
-Value builtin_gather_create_coro(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token) {
-    (void)interpreter;
-    if (arg_count != 1 || args[0].type != VAL_ARRAY) {
-        report_error("Runtime", "gather() takes one argument: an array of coroutines.", call_site_token);
-    }
-
-    Array* tasks_array = args[0].as.array_val;
-    for (int i = 0; i < tasks_array->count; ++i) {
-        if (tasks_array->elements[i].type != VAL_COROUTINE) {
-            report_error("Runtime", "All elements in the array passed to gather() must be coroutines.", call_site_token);
+    switch (subject.type) {
+        case VAL_INT:           type_str = "integer"; break;
+        case VAL_FLOAT:         type_str = "float"; break;
+        case VAL_STRING:        type_str = "string"; break;
+        case VAL_BOOL:          type_str = "boolean"; break;
+        case VAL_ARRAY:         type_str = "array"; break;
+        case VAL_TUPLE:         type_str = "tuple"; break;
+        case VAL_DICT:          type_str = "dictionary"; break;
+        case VAL_FUNCTION:      type_str = "function"; break;
+        case VAL_BLUEPRINT:     type_str = "blueprint"; break;
+        case VAL_OBJECT:        type_str = "object"; break;
+        case VAL_BOUND_METHOD:  type_str = "bound_method"; break;
+        case VAL_COROUTINE:     type_str = "coroutine"; break;
+        case VAL_GATHER_TASK:   type_str = "gather_task"; break;
+        case VAL_SUPER_PROXY:   type_str = "internal_super_proxy"; break;
+        case VAL_NULL:          type_str = "null"; break;
+        default: {
+            char err_msg[200];
+            snprintf(err_msg, sizeof(err_msg), "type() called with unknown internal type (%d).", subject.type);
+            report_error("Internal", err_msg, call_site_token);
+            type_str = "unknown"; // Fallback, though report_error exits
+            break;
         }
     }
-
-    Coroutine* gather_coro = malloc(sizeof(Coroutine));
-    if (!gather_coro) {
-        report_error("System", "Failed to allocate Coroutine for gather.", call_site_token);
+    result_val.as.string_val = strdup(type_str);
+    if (!result_val.as.string_val) {
+        report_error("System", "Failed to allocate memory for type string result.", call_site_token);
     }
-
-    gather_coro->name = strdup("gather_task");
-    gather_coro->function_def = NULL;
-    gather_coro->execution_scope = NULL;
-    gather_coro->state = CORO_NEW;
-    gather_coro->result_value = create_null_value();
-    gather_coro->exception_value = create_null_value();
-    gather_coro->has_exception = 0;
-    gather_coro->awaiting_on_coro = NULL;
-    gather_coro->value_from_await = create_null_value();
-    gather_coro->is_resumed_from_await = 0;
-    gather_coro->wakeup_time_sec = 0; // Not timer based
-
-    // Deep copy the array of coroutine Values for gather_tasks
-    gather_coro->gather_tasks = malloc(sizeof(Array));
-    if (!gather_coro->gather_tasks) { free(gather_coro->name); free(gather_coro); report_error("System", "Failed to allocate gather_tasks array.", call_site_token); }
-    gather_coro->gather_tasks->count = tasks_array->count;
-    gather_coro->gather_tasks->capacity = tasks_array->count; // Exact capacity
-    if (tasks_array->count > 0) {
-        gather_coro->gather_tasks->elements = malloc(tasks_array->count * sizeof(Value));
-        if (!gather_coro->gather_tasks->elements) { free(gather_coro->name); free(gather_coro->gather_tasks); free(gather_coro); report_error("System", "Failed to allocate elements for gather_tasks.", call_site_token); }
-        for (int i = 0; i < tasks_array->count; ++i) {
-            gather_coro->gather_tasks->elements[i] = value_deep_copy(tasks_array->elements[i]);
-        }
-    } else {
-        gather_coro->gather_tasks->elements = NULL;
-    }
-
-    gather_coro->gather_results = malloc(sizeof(Array));
-     if (!gather_coro->gather_results) { /* cleanup */ report_error("System", "Failed to allocate gather_results array.", call_site_token); }
-    gather_coro->gather_results->count = 0; // Will be filled as tasks complete
-    gather_coro->gather_results->capacity = tasks_array->count;
-    if (tasks_array->count > 0) {
-        gather_coro->gather_results->elements = calloc(tasks_array->count, sizeof(Value)); // Initialize with null-like values
-        if (!gather_coro->gather_results->elements) { /* cleanup */ report_error("System", "Failed to allocate elements for gather_results.", call_site_token); }
-    } else {
-        gather_coro->gather_results->elements = NULL;
-    }
-
-    gather_coro->gather_pending_count = tasks_array->count;
-    gather_coro->gather_first_exception_idx = -1;
-    gather_coro->parent_gather_coro = NULL; // Top-level gather has no parent gather
-    gather_coro->is_cancelled = 0;
-    gather_coro->ref_count = 1;
-    gather_coro->waiters_head = NULL;
-
-    Value coro_val;
-    coro_val.type = VAL_GATHER_TASK; // Use specific type for gather tasks
-    coro_val.as.coroutine_val = gather_coro;
-    return coro_val;
+    return result_val;
 }
 
-Value builtin_cancel_coro(Interpreter* interpreter, Value* args, int arg_count, Token* call_site_token) {
-    (void)interpreter;
-    if (arg_count != 1 || (args[0].type != VAL_COROUTINE && args[0].type != VAL_GATHER_TASK)) {
-        report_error("Runtime", "cancel() takes one argument: a coroutine object.", call_site_token);
-    }
-
-    Coroutine* coro_to_cancel = args[0].as.coroutine_val;
-    if (coro_to_cancel->state != CORO_DONE) {
-        coro_to_cancel->is_cancelled = 1;
-        // If it's a gather task, recursively cancel its children if they are not done
-        if (args[0].type == VAL_GATHER_TASK && coro_to_cancel->gather_tasks) {
-            for (int i = 0; i < coro_to_cancel->gather_tasks->count; ++i) {
-                builtin_cancel_coro(interpreter, &coro_to_cancel->gather_tasks->elements[i], 1, call_site_token);
-            }
-        }
-    }
-    return create_null_value();
-}

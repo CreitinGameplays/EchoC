@@ -18,6 +18,10 @@ void symbol_table_set(Scope* current_scope, const char* name, Value value);
 // Returns a pointer to the Value in the table (not a copy), or NULL if not found.
 Value* symbol_table_get(Scope* current_scope, const char* name);
 
+// Defines (or updates) a variable ONLY in the given scope.
+// Does not search outer scopes. Used for 'let'.
+void symbol_table_define(Scope* scope, const char* name, Value value);
+
 // Gets a variable's value from the specified scope only (not outer scopes).
 // Returns a pointer to the Value in the table, or NULL if not found locally.
 Value* symbol_table_get_local(Scope* scope, const char* name);
@@ -30,5 +34,11 @@ typedef struct {
 
 // Gets a variable's value and its definition scope.
 VarScopeInfo get_variable_definition_scope_and_value(Scope* search_start_scope, const char* name);
+
+// Prints the contents of a scope for debugging.
+void print_scope_contents(Scope* scope);
+
+// Frees all symbol nodes in a linked list
+void free_symbol_nodes(SymbolNode* symbols);
 
 #endif // ECHOC_SCOPE_H

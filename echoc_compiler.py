@@ -3,7 +3,6 @@ import sys
 import os
 
 # The list of our C source files, in the correct order
-# Ensure all necessary .c files are listed here.
 C_SOURCE_FILES = [
     "src_c/header.c",
     "src_c/lexer.c",
@@ -12,6 +11,7 @@ C_SOURCE_FILES = [
     "src_c/dictionary.c",
     "src_c/value_utils.c",
     "src_c/modules/builtins.c",
+    "src_c/modules/weaver.c",
     "src_c/module_loader.c", # Added module loader
     "src_c/expression_parser.c",
     "src_c/statement_parser.c",
@@ -37,7 +37,7 @@ def main():
         compile_command = ["gcc", "-std=c11", "-c", c_file, "-o", obj_file, "-I", "src_c", "-lm", "-D_POSIX_C_SOURCE=200809L", "-D_DEFAULT_SOURCE"]
         if DEBUG_MODE:
             print(f"    -> Compiling {c_file} in DEBUG mode.")
-            compile_command.extend(["-g", "-DDEBUG_ECHOC", "-Wall", "-Wextra", "-Wpedantic"])
+            compile_command.extend(["-g", "-DDEBUG_ECHOC", "-Wall", "-Wextra", "-Wpedantic", "-fsanitize=address"])
             # Uncomment to treat warnings as errors
             # compile_command.append("-Werror")
         try:
@@ -51,6 +51,9 @@ def main():
     # Link all object files into the final executable.
     print(f"[2] Linking object files into '{executable_name}'...")
     link_command = ["gcc", "-std=c11"] + object_files + ["-o", executable_name, "-lm"]
+    if DEBUG_MODE:
+        print(f"    -> Linking with AddressSanitizer enabled.")
+        link_command.append("-fsanitize=address")
     try:
         subprocess.run(link_command, check=True)
         print(f"    -> Success! '{executable_name}' is ready.")

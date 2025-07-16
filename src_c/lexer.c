@@ -19,8 +19,7 @@ Token* make_token(TokenType type, char* value, int line, int col) {
 void free_token(Token* token) {
     if (token) {
         // Enhanced Debugging for free_token
-        DEBUG_PRINTF("FREE_TOKEN: Addr=%p, Type=%s (%d), Value='%s', Line=%d, Col=%d",
-                     (void*)token, (token->type < 63 && token->type >=0) ? token_type_to_string(token->type) : "INVALID", token->type,
+        DEBUG_PRINTF("FREE_TOKEN: Addr=%p, Type=%s (%d), Value='%s', Line=%d, Col=%d", (void*)token, (token->type == TOKEN_EOF ? "EOF" : token_type_to_string(token->type)), token->type,
                      token->value ? token->value : "NULL", token->line, token->col);
         // Free the token's value only if it's a type that dynamically allocates its value string.
         // Single-character tokens (PLUS, MINUS, etc.) use string literals for their value,
@@ -30,8 +29,7 @@ void free_token(Token* token) {
             case TOKEN_INTEGER:
             case TOKEN_FLOAT:
             case TOKEN_STRING:
-            case TOKEN_ID:
-            case TOKEN_SHOW:  // "show" is processed as an ID first            
+            case TOKEN_ID:        
             case TOKEN_LET:   // "let" is processed as an ID first
             case TOKEN_TRUE:  // "true" is processed as an ID first
             case TOKEN_FALSE: // "false" is processed as an ID first
@@ -46,6 +44,7 @@ void free_token(Token* token) {
             case TOKEN_FOR:
             case TOKEN_FROM:
             case TOKEN_TO:
+            case TOKEN_SKIP:
             case TOKEN_STEP:
             case TOKEN_IN:
             case TOKEN_BREAK:
@@ -53,11 +52,13 @@ void free_token(Token* token) {
             case TOKEN_FUNCT:
             case TOKEN_RETURN:
             case TOKEN_NULL:
-            case TOKEN_END:
+            //case TOKEN_END: deprecated
             case TOKEN_TRY:
             case TOKEN_CATCH:
             case TOKEN_AS:
+            case TOKEN_ASSIGN_KEYWORD:
             case TOKEN_FINALLY:
+            case TOKEN_IS:
             case TOKEN_BLUEPRINT:
             case TOKEN_INHERITS:
             case TOKEN_SUPER:
@@ -65,7 +66,6 @@ void free_token(Token* token) {
             case TOKEN_LOAD:
             case TOKEN_ASYNC:
             case TOKEN_AWAIT:
-            case TOKEN_RUN:
             case TOKEN_EQ:  // "=="
             case TOKEN_NEQ: // "!="
             case TOKEN_LTE: // "<="
@@ -86,10 +86,12 @@ void free_token(Token* token) {
 }
 
 void lexer_advance(Lexer* lexer) {
+    // DEBUG_PRINTF("LEXER_ADVANCE_START: Pos=%d, Line=%d, Col=%d, Char='%c'(%d)", lexer->pos, lexer->line, lexer->col, lexer->current_char, lexer->current_char);
     // First, check for newlines to update position correctly
     if (lexer->current_char == '\n') {
         lexer->line++;
         lexer->col = 0; // Reset column BEFORE advancing
+        //DEBUG_PRINTF("  LEXER_ADVANCE_NEWLINE: Line incremented to %d, Col reset to 0", lexer->line);
     }
 
     lexer->pos++;
@@ -100,15 +102,29 @@ void lexer_advance(Lexer* lexer) {
     } else {
         lexer->current_char = lexer->text[lexer->pos]; // current_char is char at new pos
     }
+    // DEBUG_PRINTF("LEXER_ADVANCE_END: Pos=%d, Line=%d, Col=%d, NewChar='%c'(%d)", lexer->pos, lexer->line, lexer->col, lexer->current_char, lexer->current_char);
 }
 
 // Renamed from lexer_get_integer_str to be more generic
 Token* lexer_get_number(Lexer* lexer) {
-    char* result_str = malloc(32);
-    int i = 0;
+    size_t capacity = 32;
+    char* result_str = malloc(capacity);
+    if (!result_str) {
+        report_error("System", "Failed to allocate memory for number string", NULL);
+    }
+    size_t i = 0;
     TokenType type = TOKEN_INTEGER; // Assume integer unless we see a dot
 
     while(lexer->current_char != '\0' && (isdigit(lexer->current_char) || lexer->current_char == '.')) {
+        if (i >= capacity - 1) { // -1 for null terminator
+            capacity *= 2;
+            char* new_result_str = realloc(result_str, capacity);
+            if (!new_result_str) {
+                free(result_str);
+                report_error("System", "Failed to reallocate memory for number string", NULL);
+            }
+            result_str = new_result_str;
+        }
         if (lexer->current_char == '.') {
             if (type == TOKEN_FLOAT) break; // Can't have two decimals
             type = TOKEN_FLOAT;
@@ -120,45 +136,113 @@ Token* lexer_get_number(Lexer* lexer) {
     return make_token(type, result_str, lexer->line, lexer->col); // Pass line and col, though they might be updated later
 }
 
+// Helper for lexer_get_string to manage buffer capacity
+static void ensure_string_capacity(char** buffer_ptr, size_t* capacity_ptr, size_t current_length, size_t chars_to_add, Lexer* lexer_for_error_reporting, int start_line, int start_col) {
+    if (current_length + chars_to_add + 1 > *capacity_ptr) { // +1 for null terminator
+        size_t new_capacity = *capacity_ptr;
+        if (new_capacity == 0) new_capacity = 64; // Should be initialized before first call
+        while (current_length + chars_to_add + 1 > new_capacity) {
+            new_capacity *= 2;
+        }
+        char* new_buffer = realloc(*buffer_ptr, new_capacity);
+        if (!new_buffer) {
+            free(*buffer_ptr);
+            Token temp_token = {TOKEN_UNKNOWN, NULL, lexer_for_error_reporting ? lexer_for_error_reporting->line : start_line, lexer_for_error_reporting ? lexer_for_error_reporting->col : start_col};
+            report_error("System", "Failed to reallocate memory for string literal buffer", &temp_token);
+        }
+        *buffer_ptr = new_buffer;
+        *capacity_ptr = new_capacity;
+    }
+}
 
 char* lexer_get_string(Lexer* lexer, char quote_char, int start_line_for_error, int start_col_for_error) {
-    char* result = malloc(1024);
-    int i = 0;
-    lexer_advance(lexer); // Skip opening quote (quote_char)
-    while(lexer->current_char != '\0' && lexer->current_char != quote_char) {
+    size_t capacity = 64;
+    char* result = malloc(capacity);
+    if (!result) {
+        Token temp_token = {TOKEN_UNKNOWN, NULL, start_line_for_error, start_col_for_error};
+        report_error("System", "Failed to allocate memory for string literal buffer", &temp_token);
+    }
+    size_t i = 0;
+    lexer_advance(lexer); // Skip the opening quote
+
+    int brace_level = 0; // To track nesting inside %{...}
+
+    while (lexer->current_char != '\0') {
+        // Check for string termination condition FIRST.
+        if (lexer->current_char == quote_char && brace_level == 0) {
+            break; // Found the end of the string.
+        }
+
         // Handle escape sequences
         if (lexer->current_char == '\\') {
-            lexer_advance(lexer); // consume the backslash
-            if (lexer->current_char == 'n') {
-                result[i++] = '\n'; // Add a real newline character
-            } else if (lexer->current_char == 't') {
-                result[i++] = '\t'; // Add a tab character
-            } else if (lexer->current_char == '\\') {
-                result[i++] = '\\'; // Add a literal backslash
-            } else if (lexer->current_char == quote_char) { // Handles \' or \"
-                result[i++] = quote_char;
-            } else { // Unknown escape sequence, treat as literal backslash and char
-                result[i++] = '\\';
-                result[i++] = lexer->current_char;
+            ensure_string_capacity(&result, &capacity, i, 1, lexer, start_line_for_error, start_col_for_error);
+            lexer_advance(lexer); // Consume backslash
+            switch (lexer->current_char) {
+                case 'n': result[i++] = '\n'; break;
+                case 't': result[i++] = '\t'; break;
+                case '\\': result[i++] = '\\'; break;
+                case '"': result[i++] = '"'; break;
+                case '\'': result[i++] = '\''; break;
+                case '%': result[i++] = '%'; break; // Allow escaping '%' itself
+                default:
+                    // For unknown escapes, just copy the character literally.
+                    // This means '\c' becomes 'c' in the string.
+                    result[i++] = lexer->current_char;
+                    break;
             }
-            lexer_advance(lexer); // move past the escaped character
-        } else {
-            result[i++] = lexer->current_char;
-            lexer_advance(lexer);
+            lexer_advance(lexer); // Consume the character after backslash
+            continue; // Go to next loop iteration
         }
+
+        // Handle interpolation start '%{' as a single, atomic unit
+        if (lexer->current_char == '%' && lexer->pos + 1 < (int)lexer->text_length && lexer->text[lexer->pos + 1] == '{') {
+            brace_level++;
+            // Append both '%' and '{' to the result string, advancing the lexer twice
+            ensure_string_capacity(&result, &capacity, i, 2, lexer, start_line_for_error, start_col_for_error);
+            result[i++] = lexer->current_char; // Append '%'
+            lexer_advance(lexer);
+            result[i++] = lexer->current_char; // Append '{'
+            lexer_advance(lexer);
+            continue; // Skip the rest of this loop iteration to avoid double-processing
+        }
+
+        // Handle nested braces if we are already inside an interpolation
+        if (brace_level > 0) {
+            if (lexer->current_char == '{') {
+                brace_level++;
+            } else if (lexer->current_char == '}') {
+                brace_level--;
+            }
+        }
+
+        // Append the current character to the result string.
+        ensure_string_capacity(&result, &capacity, i, 1, lexer, start_line_for_error, start_col_for_error);
+        result[i++] = lexer->current_char;
+        lexer_advance(lexer);
     }
-    result[i] = '\0';
-    if (lexer->current_char != quote_char) { // Unterminated string
+
+    if (lexer->current_char != quote_char) {
         free(result);
         char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg), "Unterminated string literal starting with %c at line %d, col %d.", quote_char, start_line_for_error, start_col_for_error);
+        snprintf(err_msg, sizeof(err_msg), "Unterminated string literal starting at line %d, col %d.", start_line_for_error, start_col_for_error);
         Token temp_token = {TOKEN_UNKNOWN, NULL, start_line_for_error, start_col_for_error};
         report_error("Lexical", err_msg, &temp_token);
-        return NULL; // Should not be reached
     }
-    lexer_advance(lexer); // Skip closing quote (quote_char)
+    
+    if (brace_level != 0) {
+        free(result);
+        char err_msg[256];
+        snprintf(err_msg, sizeof(err_msg), "Mismatched braces in string interpolation starting at line %d, col %d.", start_line_for_error, start_col_for_error);
+        Token temp_token = {TOKEN_UNKNOWN, NULL, start_line_for_error, start_col_for_error};
+        report_error("Lexical", err_msg, &temp_token);
+    }
+
+    lexer_advance(lexer); // Skip the final closing quote
+
+    result[i] = '\0';
     return result;
 }
+
 
 char* lexer_get_identifier(Lexer* lexer) {
     size_t capacity = 32; // Initial capacity
@@ -185,12 +269,12 @@ char* lexer_get_identifier(Lexer* lexer) {
 }
 
 
-// Helper function to parse multiline strings starting with ```
+// Helper function to parse multiline strings starting with """
 char* lexer_get_multiline_string(Lexer* lexer, int start_line_for_error, int start_col_for_error) {
-    // Consume opening ```
-    lexer_advance(lexer); // `
-    lexer_advance(lexer); // ``
-    lexer_advance(lexer); // ```
+    // Consume opening """
+    lexer_advance(lexer); // "
+    lexer_advance(lexer); // ""
+    lexer_advance(lexer); // """
 
     size_t capacity = 1024; // Initial buffer capacity
     char* buffer = malloc(capacity);
@@ -207,20 +291,20 @@ char* lexer_get_multiline_string(Lexer* lexer, int start_line_for_error, int sta
             // Unterminated multiline string
             free(buffer);
             char err_msg[256];
-            snprintf(err_msg, sizeof(err_msg), "Unterminated multiline string (```) starting at line %d, col %d.", start_line_for_error, start_col_for_error);
+            snprintf(err_msg, sizeof(err_msg), "Unterminated multiline string (\"\"\") starting at line %d, col %d.", start_line_for_error, start_col_for_error);
             Token temp_token = {TOKEN_UNKNOWN, NULL, start_line_for_error, start_col_for_error};
             report_error("Lexical", err_msg, &temp_token);
             return NULL; // Should not be reached
         }
 
-        if (lexer->current_char == '`' &&
+        if (lexer->current_char == '"' &&
             lexer->pos + 2 < (int)lexer->text_length &&
-            lexer->text[lexer->pos + 1] == '`' &&
-            lexer->text[lexer->pos + 2] == '`') {
-            // Found closing ```
-            lexer_advance(lexer); // `
-            lexer_advance(lexer); // ``
-            lexer_advance(lexer); // ```
+            lexer->text[lexer->pos + 1] == '"' &&
+            lexer->text[lexer->pos + 2] == '"') {
+            // Found closing """
+            lexer_advance(lexer); // "
+            lexer_advance(lexer); // ""
+            lexer_advance(lexer); // """
             break; // Exit loop
         }
 
@@ -242,6 +326,19 @@ char* lexer_get_multiline_string(Lexer* lexer, int start_line_for_error, int sta
     return buffer;
 }
 
+// New function to peek at the next token without consuming it from the main lexer stream.
+// The returned token is a new allocation and must be freed by the caller.
+Token* peek_next_token(Lexer* lexer) {
+    // Create a temporary lexer to advance without affecting the main one.
+    Lexer temp_lexer = *lexer; 
+    
+    Token* next_token = get_next_token(&temp_lexer);
+    
+    // No need to restore state on the main lexer, as we used a copy.
+    // The caller is responsible for freeing the returned token.
+    return next_token;
+}
+
 // --- Lexer State Management Functions ---
 LexerState get_lexer_state(Lexer* lexer) {
     LexerState state;
@@ -251,22 +348,49 @@ LexerState get_lexer_state(Lexer* lexer) {
     state.col = lexer->col;
     state.text = lexer->text;               // Save text pointer
     state.text_length = lexer->text_length; // Save text length
+    DEBUG_PRINTF("GET_LEXER_STATE: For Lexer ADDR=%p. Captured: Pos=%d, Line=%d, Col=%d, TextPtr=%p, TextLen=%zu, CurrentCharRelevantToPos='%c'",
+                 (void*)lexer, // Log address of lexer being snapshotted
+                 state.pos, state.line, state.col, (void*)state.text, state.text_length, (state.pos < (int)state.text_length && state.pos >= 0 ? state.text[state.pos] : '?'));
     return state;
 }
 
 void set_lexer_state(Lexer* lexer, LexerState state) {
+    // Restore text and text_length first, as they are needed for pos validation and line/col recalc.
+    lexer->text = state.text;
+    lexer->text_length = state.text_length;
     lexer->pos = state.pos;
-    lexer->current_char = state.current_char;
-    lexer->line = state.line;
-    lexer->col = state.col;
-    lexer->text = state.text;               // Restore text pointer
-    lexer->text_length = state.text_length; // Restore text length
-    // Ensure current_char is correctly set if pos is at/beyond text_length
+
+    // Validate pos against the (potentially new) text_length
+    if (lexer->pos < 0) lexer->pos = 0; // Basic sanity
+    if ((size_t)lexer->pos > lexer->text_length) lexer->pos = lexer->text_length; // Cap pos at end
+
+    // Recalculate line and col from the restored pos and text, ignoring state.line and state.col
+    // as they might be corrupted.
+    int current_l = 1;
+    int current_c = 1;
+    for (int i = 0; i < lexer->pos; ++i) {
+        // Ensure we don't read past the buffer if pos was capped but text is shorter than original state.pos
+        if (i >= (int)lexer->text_length) break; 
+        if (lexer->text[i] == '\n') {
+            current_l++;
+            current_c = 1;
+        } else {
+            current_c++;
+        }
+    }
+    lexer->line = current_l;
+    lexer->col = current_c;
+
     if ((size_t)lexer->pos >= lexer->text_length) {
         lexer->current_char = '\0';
     } else {
         lexer->current_char = lexer->text[lexer->pos];
     }
+
+    DEBUG_PRINTF("SET_LEXER_STATE (Recalculated): For Lexer ADDR=%p. Input State (Pos=%d, Line=%d, Col=%d). Effective: Pos=%d, Line=%d, Col=%d, TextPtr=%p, TextLen=%zu, CurrentChar='%c'",
+                 (void*)lexer,
+                 state.pos, state.line, state.col, // Log original input state for comparison
+                 lexer->pos, lexer->line, lexer->col, (void*)lexer->text, lexer->text_length, lexer->current_char);
 }
 
 // Rewinds the lexer to a saved state and fetches the token at that position.
@@ -327,7 +451,9 @@ LexerState get_lexer_state_for_token_start(Lexer* lexer, int token_line, int tok
 Token* get_next_token(Lexer* lexer) {
     int line_at_token_start;
     int col_at_token_start;
+    DEBUG_PRINTF("GET_NEXT_TOKEN_TOP: Pos=%d, Line=%d, Col=%d, Char='%c'(%d)", lexer->pos, lexer->line, lexer->col, lexer->current_char, lexer->current_char);
 
+    DEBUG_PRINTF("GET_NEXT_TOKEN_LOOP_START: Pos=%d, Line=%d, Col=%d, Char='%c'(%d)", lexer->pos, lexer->line, lexer->col, lexer->current_char, lexer->current_char);
     while (lexer->current_char != '\0') {
         // int skipped_something = 0;  unused
 
@@ -381,7 +507,9 @@ Token* get_next_token(Lexer* lexer) {
 
         // 1. Skip whitespace
         if (isspace((unsigned char)lexer->current_char)) {
+            DEBUG_PRINTF("  GET_NEXT_TOKEN_SKIP_WHITESPACE: Char='%c'(%d) at L%d C%d", lexer->current_char, lexer->current_char, lexer->line, lexer->col);
             lexer_advance(lexer);
+            DEBUG_PRINTF("  GET_NEXT_TOKEN_AFTER_SKIP_WHITESPACE_ADVANCE: New Char='%c'(%d) at L%d C%d", lexer->current_char, lexer->current_char, lexer->line, lexer->col);
             continue;
         }
 
@@ -390,11 +518,13 @@ Token* get_next_token(Lexer* lexer) {
             lexer->pos + 2 < (int)lexer->text_length &&
             lexer->text[lexer->pos + 1] == '\'' &&
             lexer->text[lexer->pos + 2] == '\'') {
+            DEBUG_PRINTF("  GET_NEXT_TOKEN_BLOCK_COMMENT_START at L%d C%d", lexer->line, lexer->col);
             
             // Consume the opening '''
             lexer_advance(lexer); 
             lexer_advance(lexer); 
             lexer_advance(lexer); 
+            bool found_closing_delimiter = false; // Flag to track if closing delimiter is found
 
             int comment_start_line = lexer->line; // For error reporting
 
@@ -408,17 +538,19 @@ Token* get_next_token(Lexer* lexer) {
                     // Consume the closing '''
                     lexer_advance(lexer); 
                     lexer_advance(lexer); 
-                    lexer_advance(lexer); 
+                    lexer_advance(lexer);
+                    found_closing_delimiter = true; // Set flag
                     break; // Exit inner while (comment content loop)
                 }
                 lexer_advance(lexer); // Advance through comment content
             }
-            if (lexer->current_char == '\0') { // Check if loop exited due to EOF
+            if (!found_closing_delimiter) { // Check if loop exited due to EOF *without* finding delimiter
                 char err_msg[256];
                 snprintf(err_msg, sizeof(err_msg), "Unterminated \"'''\" block comment that started on line %d.", comment_start_line);
                 Token temp_error_token = {TOKEN_UNKNOWN, NULL, lexer->line, lexer->col};
                 report_error("Lexical", err_msg, &temp_error_token);
             }
+            DEBUG_PRINTF("  GET_NEXT_TOKEN_BLOCK_COMMENT_END at L%d C%d", lexer->line, lexer->col);
             continue; 
         }
 
@@ -431,27 +563,32 @@ Token* get_next_token(Lexer* lexer) {
         }
         
         if (lexer->current_char == '-' && lexer->pos + 1 < (int)lexer->text_length && lexer->text[lexer->pos + 1] == '-') {
-            DEBUG_PRINTF("Inline comment '--' detected at L%d C%d. Skipping.", lexer->line, lexer->col);
-            lexer_advance(lexer); 
-            lexer_advance(lexer); 
+            DEBUG_PRINTF("  GET_NEXT_TOKEN_INLINE_COMMENT_START: Char='%c' at L%d C%d. Skipping.", lexer->current_char, lexer->line, lexer->col);
+            lexer_advance(lexer); // Consume the first '-'
+            int comment_start_line = lexer->line; // Line where -- started
+            int comment_start_col = lexer->col -1; // Column of the first '-'
+            lexer_advance(lexer); // Consume the second '-'
             
-            int closed_by_delimiter = 0;
-            while (lexer->current_char != '\0' && lexer->current_char != '\n') {
-                // Check for closing '--' *inside* the loop to allow it to terminate the comment mid-line
+            // Consume characters until newline or EOF
+            bool found_closing_delimiter = false;
+            // Consume characters until the closing '--' or EOF
+            while (lexer->current_char != '\0') {
                 if (lexer->current_char == '-' && lexer->pos + 1 < (int)lexer->text_length && lexer->text[lexer->pos + 1] == '-') {
-                    DEBUG_PRINTF("Found closing '--' for inline comment at L%d C%d.", lexer->line, lexer->col);
-                    lexer_advance(lexer); // Consume first '-' of closing
-                    lexer_advance(lexer); // Consume second '-' of closing
-                    closed_by_delimiter = 1;
-                    break; 
+                    lexer_advance(lexer); // Consume the first '-' of closing delimiter
+                    lexer_advance(lexer); // Consume the second '-' of closing delimiter
+                    found_closing_delimiter = true;
+                    break;
                 }
                 lexer_advance(lexer); 
             }
-            // After skipping, continue the main loop to find the next token
-            // or handle more whitespace/comments.
-            // If closed_by_delimiter, we've advanced past it.
-            // If not, we stopped at EOL or EOF. The outer loop's isspace() or EOF check will handle it.
-            DEBUG_PRINTF("Inline comment processing finished. Closed by delimiter: %d. Current char: '%c'", closed_by_delimiter, lexer->current_char);
+            if (!found_closing_delimiter) {
+                char err_msg[256];
+                snprintf(err_msg, sizeof(err_msg), "Unterminated inline comment '--' that started on line %d, col %d.", comment_start_line, comment_start_col);
+                Token temp_error_token = {TOKEN_UNKNOWN, NULL, lexer->line, lexer->col};
+                report_error("Lexical", err_msg, &temp_error_token);
+            }
+            
+            DEBUG_PRINTF("  GET_NEXT_TOKEN_INLINE_COMMENT_END: Char='%c'(%d) at L%d C%d", lexer->current_char, lexer->current_char, lexer->line, lexer->col);
             continue; // Restart token search from current position
         }
 
@@ -459,21 +596,13 @@ Token* get_next_token(Lexer* lexer) {
         // If we reach here, it means current_char is part of a token
         line_at_token_start = lexer->line; // Capture line/col *after* skipping
         col_at_token_start = lexer->col;
+        DEBUG_PRINTF("  GET_NEXT_TOKEN_TOKEN_START_CAPTURE: Line=%d, Col=%d, Char='%c'(%d)", line_at_token_start, col_at_token_start, lexer->current_char, lexer->current_char);
 
         // --- Token Parsing Logic ---
         // This section should only be reached if no whitespace or comment was skipped in this iteration.
         { 
-            // Check for multiline string delimiter ``` FIRST
-            if (lexer->current_char == '`' &&
-                lexer->pos + 2 < (int)lexer->text_length &&
-                lexer->text[lexer->pos + 1] == '`' &&
-                lexer->text[lexer->pos + 2] == '`') {
-                return make_token(TOKEN_STRING, lexer_get_multiline_string(lexer, line_at_token_start, col_at_token_start), line_at_token_start, col_at_token_start);
-            }
-
             if (isalpha((unsigned char)lexer->current_char) || lexer->current_char == '_') {
                 char* id_str = lexer_get_identifier(lexer);
-                if (strcmp(id_str, "show") == 0) return make_token(TOKEN_SHOW, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "let") == 0) return make_token(TOKEN_LET, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "true") == 0) return make_token(TOKEN_TRUE, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "false") == 0) return make_token(TOKEN_FALSE, id_str, line_at_token_start, col_at_token_start);
@@ -490,14 +619,15 @@ Token* get_next_token(Lexer* lexer) {
                 if (strcmp(id_str, "from") == 0) return make_token(TOKEN_FROM, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "to") == 0) return make_token(TOKEN_TO, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "step") == 0) return make_token(TOKEN_STEP, id_str, line_at_token_start, col_at_token_start);
+                if (strcmp(id_str, "skip") == 0) return make_token(TOKEN_SKIP, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "in") == 0) return make_token(TOKEN_IN, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "break") == 0) return make_token(TOKEN_BREAK, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "continue") == 0) return make_token(TOKEN_CONTINUE, id_str, line_at_token_start, col_at_token_start);
-                if (strcmp(id_str, "end") == 0) return make_token(TOKEN_END, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "funct") == 0) return make_token(TOKEN_FUNCT, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "return") == 0) return make_token(TOKEN_RETURN, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "try") == 0) return make_token(TOKEN_TRY, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "catch") == 0) return make_token(TOKEN_CATCH, id_str, line_at_token_start, col_at_token_start);
+                if (strcmp(id_str, "is") == 0) return make_token(TOKEN_IS, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "as") == 0) return make_token(TOKEN_AS, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "finally") == 0) return make_token(TOKEN_FINALLY, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "blueprint") == 0) return make_token(TOKEN_BLUEPRINT, id_str, line_at_token_start, col_at_token_start);
@@ -507,17 +637,35 @@ Token* get_next_token(Lexer* lexer) {
                 if (strcmp(id_str, "load") == 0) return make_token(TOKEN_LOAD, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "async") == 0) return make_token(TOKEN_ASYNC, id_str, line_at_token_start, col_at_token_start);
                 if (strcmp(id_str, "await") == 0) return make_token(TOKEN_AWAIT, id_str, line_at_token_start, col_at_token_start);
-                if (strcmp(id_str, "run") == 0) return make_token(TOKEN_RUN, id_str, line_at_token_start, col_at_token_start);
+                DEBUG_PRINTF("  GET_NEXT_TOKEN_RETURNING_TOKEN: Type=IDENTIFIER, Value='%s', Line=%d, Col=%d", id_str, line_at_token_start, col_at_token_start);
                 return make_token(TOKEN_ID, id_str, line_at_token_start, col_at_token_start);
             }
             if (isdigit((unsigned char)lexer->current_char)) {
                 Token* num_token = lexer_get_number(lexer);
                 num_token->line = line_at_token_start; // Ensure correct line/col
                 num_token->col = col_at_token_start;
+                DEBUG_PRINTF("  GET_NEXT_TOKEN_RETURNING_TOKEN: Type=%s, Value='%s', Line=%d, Col=%d", token_type_to_string(num_token->type), num_token->value, line_at_token_start, col_at_token_start);
                 return num_token;
             }
-            if (lexer->current_char == '"') return make_token(TOKEN_STRING, lexer_get_string(lexer, '"', line_at_token_start, col_at_token_start), line_at_token_start, col_at_token_start);
-            if (lexer->current_char == '\'') return make_token(TOKEN_STRING, lexer_get_string(lexer, '\'', line_at_token_start, col_at_token_start), line_at_token_start, col_at_token_start);
+            // Check for multiline string delimiter """ FIRST
+            if (lexer->current_char == '"' &&
+                lexer->pos + 2 < (int)lexer->text_length &&
+                lexer->text[lexer->pos + 1] == '"' &&
+                lexer->text[lexer->pos + 2] == '"') {
+                char* ml_str = lexer_get_multiline_string(lexer, line_at_token_start, col_at_token_start);
+                DEBUG_PRINTF("  GET_NEXT_TOKEN_RETURNING_TOKEN: Type=STRING (multiline), Value_len=%zu, Line=%d, Col=%d", ml_str ? strlen(ml_str) : 0, line_at_token_start, col_at_token_start);
+                return make_token(TOKEN_STRING, ml_str, line_at_token_start, col_at_token_start);
+            }
+            if (lexer->current_char == '"') {
+                char* s_str = lexer_get_string(lexer, '"', line_at_token_start, col_at_token_start);
+                DEBUG_PRINTF("  GET_NEXT_TOKEN_RETURNING_TOKEN: Type=STRING (double-quoted), Value_len=%zu, Line=%d, Col=%d", s_str ? strlen(s_str) : 0, line_at_token_start, col_at_token_start);
+                return make_token(TOKEN_STRING, s_str, line_at_token_start, col_at_token_start);
+            }
+            if (lexer->current_char == '\'') {
+                char* s_str = lexer_get_string(lexer, '\'', line_at_token_start, col_at_token_start);
+                DEBUG_PRINTF("  GET_NEXT_TOKEN_RETURNING_TOKEN: Type=STRING (single-quoted), Value_len=%zu, Line=%d, Col=%d", s_str ? strlen(s_str) : 0, line_at_token_start, col_at_token_start);
+                return make_token(TOKEN_STRING, s_str, line_at_token_start, col_at_token_start);
+            }
 
             if (lexer->current_char == '+') { lexer_advance(lexer); return make_token(TOKEN_PLUS, "+", line_at_token_start, col_at_token_start); }
             if (lexer->current_char == '-') { lexer_advance(lexer); return make_token(TOKEN_MINUS, "-", line_at_token_start, col_at_token_start); }
@@ -560,5 +708,6 @@ Token* get_next_token(Lexer* lexer) {
             exit(1);
         }
     }
+    DEBUG_PRINTF("GET_NEXT_TOKEN_EOF: Line=%d, Col=%d", lexer->line, lexer->col);
     return make_token(TOKEN_EOF, "", lexer->line, lexer->col);
 }

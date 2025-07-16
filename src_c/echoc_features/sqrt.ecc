@@ -1,15 +1,14 @@
-show:"-- sqrt.ecc module is being loaded and executed! --":
+-- compute the square root with binary search --
 
 funct: binary_search_sqrt(x, precision=0.000001):
     if: x < 0:
         raise: "Cannot compute square root of a negative number.":
-    end:
-    if: x == 0:
+    elif: x == 0:
         return: 0.0:
-    end:
-    let: low = 0:
-    let: high = (x >= 1 ? x : 1):  -- Adjust high for numbers less than 1 --
 
+    let: low = 0:
+    let: high = x if x >= 1 else 1:  -- Adjust high for numbers less than 1 --
+    
     loop: while (high - low) > precision:
         let: mid = (low + high) / 2:
         if: mid * mid == x:
@@ -18,14 +17,13 @@ funct: binary_search_sqrt(x, precision=0.000001):
             let: low = mid:
         else:
             let: high = mid:
-        end:
-    end:
     return: (low + high) / 2:
-end:
+    
 
--- Example usage, will run when module is first loaded --
--- let: test_sqrt_val = binary_search_sqrt(16): --
--- show:"Test sqrt(16) from within sqrt.ecc: %{test_sqrt_val}": --
-
--- To make it cleaner as a module, you might remove or comment out direct test calls like the one above. --
--- The function binary_search_sqrt is automatically exported. --
+'''
+This will run when module is first loaded
+Example code:
+load:binary_search_sqrt from sqrt:
+let: test_sqrt_val = binary_search_sqrt(16):
+show("Test sqrt(16) from within sqrt.ecc: %{test_sqrt_val}"):
+'''

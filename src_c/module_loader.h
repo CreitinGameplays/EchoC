@@ -20,6 +20,7 @@ char* resolve_module_path(Interpreter* interpreter, const char* module_name_or_p
 // Otherwise, executes the module, caches it, and returns its namespace.
 // The returned Value is owned by the cache or is a fresh VAL_DICT.
 Value load_module_from_path(Interpreter* interpreter, const char* absolute_module_path, Token* error_token);
+Value get_or_create_builtin_module(Interpreter* interpreter, const char* module_name, Token* error_token);
 
 // Helper to get the directory part of a file path.
 // Caller must free the returned string.

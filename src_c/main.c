@@ -1,12 +1,24 @@
 // src_c/main.c
 #include "header.h"
 #include "module_loader.h" // For initialize_module_system, cleanup_module_system
+#include "value_utils.h"   // For coroutine_decref_and_free_if_zero
+#include "dictionary.h"    // For dictionary_set
 
 #include "scope.h"         // For symbol_table_set, free_scope
+#include <sys/stat.h>      // For stat() to check file type
 
-#ifdef DEBUG_ECHOC
+
+// Define global log file pointer
 FILE* echoc_debug_log_file = NULL; // Define global log file pointer
+
+Interpreter* g_interpreter_for_error_reporting = NULL;
+#ifdef DEBUG_ECHOC
 #endif
+
+// Define global ID counters (declared as extern in header.h)
+uint64_t next_scope_id = 0;
+uint64_t next_dictionary_id = 0;
+uint64_t next_object_id = 0;
 
 // Implementation of free_value_contents (forward declared in header.c)
 void free_value_contents(Value val) {
@@ -51,9 +63,11 @@ void free_value_contents(Value val) {
             }
             free(func->params);
         }
-        // source_text_owned_copy is strdup'd by value_deep_copy.
-        // The Function struct created by interpret_funct_statement does not own this string after it's copied.
-        if (func->source_text_owned_copy && func->is_source_owner) { // Check ownership flag
+        // Only free source_text_owned_copy if this Function instance is marked as its owner.
+        // This prevents double-free if multiple Value structs point to the same Function struct
+        // (e.g., one in symbol table, one temporary Value being freed), and only one
+        // should be responsible for the text.
+        if (func->source_text_owned_copy && func->is_source_owner) { // Check ownership flag // TOKEN_END removed
             free(func->source_text_owned_copy);
         }
         // func->definition_scope is not freed here; scopes are managed by enter/exit_scope
@@ -64,73 +78,32 @@ void free_value_contents(Value val) {
         // VAL_BLUEPRINT values are pointers to the canonical Blueprint definition.
         // The actual Blueprint struct is freed when its defining symbol is freed (see free_symbol_nodes).
         // Thus, free_value_contents does nothing for VAL_BLUEPRINT here.
-        } else if (val.type == VAL_OBJECT && val.as.object_val != NULL) { // Corrected: free copied objects
-        // If value_deep_copy for VAL_OBJECT only copies the pointer,
-        // free_value_contents should not free the object itself here if it's not an owned copy.
-        // However, if this Value is a fresh copy (e.g. from value_deep_copy of an object), it should be freed.
-        DEBUG_PRINTF("Freeing object: %p", (void*)val.as.object_val);
-        Object* obj_to_free = val.as.object_val;
-        if (obj_to_free->instance_attributes) {
-            free_scope(obj_to_free->instance_attributes); // Frees symbols and scope struct
+        } else if (val.type == VAL_OBJECT && val.as.object_val != NULL) {
+        Object* obj = val.as.object_val;
+        
+        obj->ref_count--;
+        DEBUG_PRINTF("FREE_VALUE_CONTENTS: Decremented ref_count for object %s (%p) to %d", obj->blueprint ? obj->blueprint->name : "unnamed_obj", (void*)obj, obj->ref_count);
+        if (obj->ref_count == 0) {
+            DEBUG_PRINTF("FREE_VALUE_CONTENTS: Freeing actual Object struct %s (%p)", obj->blueprint ? obj->blueprint->name : "unnamed_obj", (void*)obj);
+            if (obj->instance_attributes) {
+                // Pass the interpreter context if available, NULL otherwise for general cleanup
+                free_scope(obj->instance_attributes); 
+            }
+            free(obj); // Free the Object struct itself
         }
-        free(obj_to_free); // Free the Object struct itself
     } else if (val.type == VAL_BOUND_METHOD && val.as.bound_method_val != NULL) {
         BoundMethod* bm = val.as.bound_method_val;
-        // If bm->self_is_owned_copy is true, the BoundMethod owns the self_value.
-        if (bm->self_is_owned_copy) {
-            free_value_contents(bm->self_value); // Free the contents of the owned self_value
+        bm->ref_count--;
+        DEBUG_PRINTF("FREE_VALUE_CONTENTS: Decremented ref_count for bound method (%p) to %d", (void*)bm, bm->ref_count);
+        if (bm->ref_count == 0) {
+            DEBUG_PRINTF("FREE_VALUE_CONTENTS: Freeing actual BoundMethod struct (%p)", (void*)bm);
+            if (bm->self_is_owned_copy) {
+                free_value_contents(bm->self_value);
+            }
+            free(bm);
         }
-        // The Function* or CBuiltinFunction pointer itself is not freed here,
-        // as EchoC functions are owned by their definition scope, and C builtins are static.
-        if (bm->type == FUNC_TYPE_ECHOC && bm->func_ptr.echoc_function == NULL) {
-        }
-        // bm->self_value is handled by self_is_owned_copy logic.
-        free(bm);
     } else if ((val.type == VAL_COROUTINE || val.type == VAL_GATHER_TASK) && val.as.coroutine_val != NULL) {
-        Coroutine* coro = val.as.coroutine_val;
-        coro->ref_count--;
-        DEBUG_PRINTF("FREE_VALUE_CONTENTS: Decremented ref_count for coro %s (%p) to %d", coro->name ? coro->name : "unnamed", (void*)coro, coro->ref_count);
-        if (coro->ref_count == 0) {
-            DEBUG_PRINTF("FREE_VALUE_CONTENTS: Freeing actual Coroutine struct %s (%p)", coro->name ? coro->name : "unnamed", (void*)coro);
-            if (coro->name) free(coro->name);
-            // The Function* (coro->function_def) is not freed here, it's owned by its definition scope.
-            if (coro->execution_scope) {
-                free_scope(coro->execution_scope); // Frees symbols and scope struct
-            }
-            free_value_contents(coro->result_value);
-            free_value_contents(coro->exception_value);
-
-            if (coro->gather_tasks) { // This is an Array of VAL_COROUTINE
-                for (int i = 0; i < coro->gather_tasks->count; ++i) {
-                    // VAL_COROUTINEs in gather_tasks had their ref_counts incremented when copied.
-                    // free_value_contents here will decrement them.
-                    free_value_contents(coro->gather_tasks->elements[i]);
-                }
-                free(coro->gather_tasks->elements);
-                free(coro->gather_tasks);
-            }
-            if (coro->gather_results) { // This is an Array of Value
-                for (int i = 0; i < coro->gather_results->count; ++i) {
-                    free_value_contents(coro->gather_results->elements[i]);
-                }
-                free(coro->gather_results->elements);
-                free(coro->gather_results);
-            }
-            free_value_contents(coro->value_from_await); // Free any lingering value from await
-            
-            // Free the waiters list
-            CoroutineWaiterNode* current_waiter = coro->waiters_head;
-            CoroutineWaiterNode* next_waiter;
-            while (current_waiter) {
-                next_waiter = current_waiter->next;
-                // The waiter_coro itself is not freed here, its lifecycle is managed by its own ref_count.
-                free(current_waiter);
-                current_waiter = next_waiter;
-            }
-            coro->waiters_head = NULL;
-
-            free(coro);
-        }
+        coroutine_decref_and_free_if_zero(val.as.coroutine_val);
     }
     // VAL_SUPER_PROXY has no dynamic content in its union part.
     // VAL_NULL has no dynamic content.
@@ -140,9 +113,15 @@ void free_value_contents(Value val) {
 // Implementation of value_deep_copy (forward declared in header.c)
 Value value_deep_copy(Value original) {
     Value copy = original; // Start with a shallow copy for simple types
+    
     if (original.type == VAL_STRING && original.as.string_val != NULL) {
         copy.as.string_val = strdup(original.as.string_val);
         if (!copy.as.string_val) report_error("System", "Failed to strdup string in value_deep_copy", NULL);
+    } else if (original.type == VAL_STRING && original.as.string_val == NULL) {
+        // This case should ideally not occur if VAL_STRING always implies a valid string pointer.
+        // However, to be robust, handle it by creating an empty string.
+        copy.as.string_val = strdup("");
+        if (!copy.as.string_val) report_error("System", "Failed to strdup empty string for NULL VAL_STRING", NULL);
     } else if (original.type == VAL_ARRAY && original.as.array_val != NULL) {
         Array* original_array = original.as.array_val;
         Array* new_array = malloc(sizeof(Array));
@@ -151,6 +130,7 @@ Value value_deep_copy(Value original) {
         new_array->capacity = original_array->capacity; // Or could start fresh with count as capacity
         new_array->elements = malloc(new_array->capacity * sizeof(Value));
         if (!new_array->elements) { free(new_array); report_error("System", "Failed to allocate memory for copied array elements", NULL); }
+        
         for (int i = 0; i < new_array->count; ++i) {
             new_array->elements[i] = value_deep_copy(original_array->elements[i]);
         }
@@ -171,79 +151,150 @@ Value value_deep_copy(Value original) {
         }
         copy.as.tuple_val = new_tuple;
     } else if (original.type == VAL_DICT && original.as.dict_val != NULL) {
+        // --- START: New, more direct dictionary copy logic ---
         Dictionary* original_dict = original.as.dict_val;
-        Dictionary* new_dict = malloc(sizeof(Dictionary));
-        if (!new_dict) report_error("System", "Failed to allocate memory for dictionary copy", NULL);
+        Dictionary* new_dict = dictionary_create(original_dict->num_buckets, NULL);
         
-        new_dict->num_buckets = original_dict->num_buckets;
-        new_dict->count = original_dict->count;
-        new_dict->buckets = calloc(new_dict->num_buckets, sizeof(DictEntry*));
-        if (!new_dict->buckets) { free(new_dict); report_error("System", "Failed to allocate memory for copied dictionary buckets", NULL); }
-
+        // Manually iterate and insert to avoid the recursive nature and side-effects
+        // of using dictionary_set (which can resize) during a copy.
         for (int i = 0; i < original_dict->num_buckets; ++i) {
             DictEntry* original_entry = original_dict->buckets[i];
-            DictEntry* current_new_chain_tail = NULL;
             while (original_entry) {
-                DictEntry* new_entry = malloc(sizeof(DictEntry));
-                if (!new_entry) report_error("System", "Failed to allocate memory for copied dictionary entry", NULL);
-                new_entry->key = strdup(original_entry->key);
-                if (!new_entry->key) { free(new_entry); report_error("System", "Failed to strdup key for copied dictionary entry", NULL); }
-                new_entry->value = value_deep_copy(original_entry->value);
-                new_entry->next = NULL;
-                if (current_new_chain_tail == NULL) {
-                    new_dict->buckets[i] = new_entry;
-                } else {
-                    current_new_chain_tail->next = new_entry;
-                }
-                current_new_chain_tail = new_entry;
+                // 1. Create the new entry with deep-copied value.
+                // This helper also strdups the key.
+                DictEntry* new_entry = dictionary_create_entry(original_entry->key, original_entry->value, NULL);
+
+                // 2. Insert it into the new dictionary's hash table directly.
+                unsigned long hash = hash_string(new_entry->key);
+                int index = hash % new_dict->num_buckets;
+                new_entry->next = new_dict->buckets[index];
+                new_dict->buckets[index] = new_entry;
+                new_dict->count++;
+
                 original_entry = original_entry->next;
             }
         }
         copy.as.dict_val = new_dict;
+        // --- END: New, more direct dictionary copy logic ---
     } else if (original.type == VAL_FUNCTION && original.as.function_val != NULL) {
         // Functions are typically "copied" by reference to their definition.
         // Here, we create a new Function struct but it points to the same underlying
         // definition details (body location, definition scope).
         // The name and parameters are duplicated as they are part of the Function struct.
         Function* original_func = original.as.function_val;
-        Function* new_func = malloc(sizeof(Function));
-        if (!new_func) report_error("System", "Failed to allocate memory for function copy", NULL);
-
-        new_func->name = strdup(original_func->name);
-        if (!new_func->name) { free(new_func); report_error("System", "Failed to strdup function name in copy", NULL); }
-        new_func->param_count = original_func->param_count;
-        new_func->params = malloc(new_func->param_count * sizeof(Parameter));
-        if (!new_func->params && new_func->param_count > 0) { free(new_func->name); free(new_func); report_error("System", "Failed to alloc params for func copy", NULL); }
-        for (int i = 0; i < new_func->param_count; ++i) {
-            new_func->params[i].name = strdup(original_func->params[i].name);
-            if (!new_func->params[i].name) { /* cleanup */ report_error("System", "Failed to strdup param name", NULL); }
-            if (original_func->params[i].default_value) {
-                new_func->params[i].default_value = malloc(sizeof(Value));
-                *(new_func->params[i].default_value) = value_deep_copy(*(original_func->params[i].default_value));
-            } else { new_func->params[i].default_value = NULL; }
+        Function* new_func = calloc(1, sizeof(Function));
+        if (!new_func) {
+            report_error("System", "Failed to allocate memory for function copy", NULL);
         }
-        new_func->body_start_state = original_func->body_start_state; // Copy struct
+
+        // Initialize all potentially allocated pointers to NULL for safe cleanup
+        new_func->name = NULL;
+        new_func->params = NULL;
+        new_func->source_text_owned_copy = NULL;
+        // Other fields will be copied directly or are not pointers needing cleanup here
+
+        // Copy name
+        new_func->name = strdup(original_func->name);
+        if (!new_func->name) {
+            free(new_func);
+            report_error("System", "Failed to strdup function name in copy", NULL);
+        }
+
+        // Copy parameters
+        new_func->param_count = original_func->param_count;
+        // Only copy parameters if they exist on the original function (i.e., it's an EchoC function)
+        if (new_func->param_count > 0 && original_func->params) {
+            new_func->params = malloc(new_func->param_count * sizeof(Parameter));
+            if (!new_func->params) {
+                free(new_func->name);
+                free(new_func);
+                report_error("System", "Failed to alloc params for func copy", NULL);
+            }
+            // Initialize all param sub-pointers to NULL
+            for (int i = 0; i < new_func->param_count; ++i) {
+                new_func->params[i].name = NULL;
+                new_func->params[i].default_value = NULL;
+            }
+
+            for (int i = 0; i < new_func->param_count; ++i) {
+                new_func->params[i].name = strdup(original_func->params[i].name);
+                if (!new_func->params[i].name) {
+                    // Cleanup already allocated parts of new_func
+                    for (int j = 0; j < i; ++j) { // Free successfully copied params before this one
+                        free(new_func->params[j].name);
+                        if (new_func->params[j].default_value) {
+                            free_value_contents(*(new_func->params[j].default_value));
+                            free(new_func->params[j].default_value);
+                        }
+                    }
+                    free(new_func->params);
+                    free(new_func->name);
+                    free(new_func);
+                    report_error("System", "Failed to strdup param name", NULL);
+                }
+
+                if (original_func->params[i].default_value) {
+                    new_func->params[i].default_value = (Value*)malloc(sizeof(Value));
+                    if (!new_func->params[i].default_value) {
+                        // Cleanup
+                        for (int j = 0; j <= i; ++j) { // Param name for 'i' is allocated
+                            free(new_func->params[j].name);
+                             // Default values for params < i are allocated
+                            if (j < i && new_func->params[j].default_value) {
+                                free_value_contents(*(new_func->params[j].default_value));
+                                free(new_func->params[j].default_value);
+                            }
+                        }
+                        free(new_func->params);
+                        free(new_func->name);
+                        free(new_func);
+                        report_error("System", "Failed to alloc for default value copy", NULL);
+                    }
+                    *(new_func->params[i].default_value) = value_deep_copy(*(original_func->params[i].default_value)); // Deep copy the default value itself
+                } else {
+                    new_func->params[i].default_value = NULL;
+                }
+            }
+        } else { // param_count is 0
+            new_func->params = NULL;
+        }
+
+        new_func->body_start_state = original_func->body_start_state; // Shallow copy first
         new_func->body_end_token_original_line = original_func->body_end_token_original_line;
         new_func->body_end_token_original_col = original_func->body_end_token_original_col;
+        new_func->definition_col = original_func->definition_col;
+        new_func->definition_line = original_func->definition_line;
         new_func->definition_scope = original_func->definition_scope; // Share the definition scope
-        // The original_func (from symbol table or another Value) already owns its source_text_owned_copy.
-        // The original_func (from symbol table or another Value) already owns its source_text_owned_copy.
-        // The new_func (the copy being made) must also get its own owned copy.
-        // The new_func (the copy being made) will own its duplicated text.
-        // The original_func->source_text_owned_copy points to the text buffer (e.g. from main lexer or another Function's owned copy).
+
+        // The original function might just be a temporary wrapper that points to a shared source text.
+        // The new copy MUST own its own copy of the source text to be safe.
         if (original_func->source_text_owned_copy) {
             new_func->source_text_owned_copy = strdup(original_func->source_text_owned_copy);
-            if (!new_func->source_text_owned_copy) { /* error, cleanup */ report_error("System", "Failed to strdup function source text in copy", NULL); }
+            if (!new_func->source_text_owned_copy) {
+                // Cleanup
+                if (new_func->params) {
+                    for (int i = 0; i < new_func->param_count; ++i) {
+                        if (new_func->params[i].name) free(new_func->params[i].name);
+                        if (new_func->params[i].default_value) {
+                            free_value_contents(*(new_func->params[i].default_value));
+                            free(new_func->params[i].default_value);
+                        }
+                    }
+                    free(new_func->params);
+                }
+                free(new_func->name);
+                free(new_func);
+                report_error("System", "Failed to strdup function source text in copy", NULL);
+            }
         } else {
-            // This case implies original_func had no source text, which might be an issue elsewhere or intentional for some builtins (though unlikely for EchoC funcs)
             new_func->source_text_owned_copy = NULL;
         }
-        new_func->source_text_length = original_func->source_text_length; // Copy length
-        // CRITICAL: Update the copied body_start_state to use the new_func's owned text
-        if (new_func->source_text_owned_copy) {
-            new_func->body_start_state.text = new_func->source_text_owned_copy;
-        }
-        new_func->is_async = original_func->is_async; // <-- FIX: Copy the is_async flag
+        new_func->source_text_length = new_func->source_text_owned_copy ? strlen(new_func->source_text_owned_copy) : 0; 
+        // Crucially, update the text pointer in the copied lexer state to point to our new owned copy.
+        // This prevents the new function from holding a dangling pointer to a temporary source buffer.
+        new_func->body_start_state.text = new_func->source_text_owned_copy; 
+        new_func->is_async = original_func->is_async;
+        new_func->c_impl = original_func->c_impl; // Copy C function pointer
         new_func->is_source_owner = (new_func->source_text_owned_copy != NULL); // The copy owns its strdup'd text
         copy.as.function_val = new_func;
     } else if (original.type == VAL_BLUEPRINT && original.as.blueprint_val != NULL) {
@@ -251,48 +302,18 @@ Value value_deep_copy(Value original) {
         // "Deep copy" of a VAL_BLUEPRINT just copies the pointer.
         // The actual Blueprint struct is managed by its defining symbol.
         copy.as.blueprint_val = original.as.blueprint_val;
-    } else if (original.type == VAL_OBJECT && original.as.object_val != NULL) {        
-        // Perform a true deep copy of the Object and its instance_attributes scope.
-        Object* original_obj = original.as.object_val;
-        Object* new_obj = malloc(sizeof(Object));
-        if (!new_obj) report_error("System", "Failed to allocate memory for object copy", NULL);
-
-        new_obj->blueprint = original_obj->blueprint; // Share blueprint definition
-        
-        // Deep copy the instance_attributes scope
-        new_obj->instance_attributes = malloc(sizeof(Scope));
-        if (!new_obj->instance_attributes) { free(new_obj); report_error("System", "Failed to alloc scope for object copy", NULL); }
-        new_obj->instance_attributes->symbols = NULL;
-        new_obj->instance_attributes->outer = NULL; // Instance scopes are isolated
-
-        SymbolNode* current_original_symbol = original_obj->instance_attributes->symbols;
-        while (current_original_symbol) {
-            // symbol_table_set on new_obj->instance_attributes will deep_copy the value
-            symbol_table_set(new_obj->instance_attributes, current_original_symbol->name, current_original_symbol->value);
-            current_original_symbol = current_original_symbol->next;
+    } else if (original.type == VAL_OBJECT && original.as.object_val != NULL) {
+        copy.as.object_val = original.as.object_val; // Copy the pointer
+        if (copy.as.object_val) {
+            copy.as.object_val->ref_count++; // Increment ref count
+            DEBUG_PRINTF("VALUE_DEEP_COPY: Incremented ref_count for object %s (%p) to %d", copy.as.object_val->blueprint ? copy.as.object_val->blueprint->name : "unnamed_obj", (void*)copy.as.object_val, copy.as.object_val->ref_count);
         }
-        copy.as.object_val = new_obj;
     } else if (original.type == VAL_BOUND_METHOD && original.as.bound_method_val != NULL) {
-        // BoundMethods are also somewhat like references.
-        BoundMethod* original_bm = original.as.bound_method_val;
-        BoundMethod* new_bm = malloc(sizeof(BoundMethod));
-        if (!new_bm) report_error("System", "Failed to allocate memory for bound_method copy", NULL);
-        new_bm->type = original_bm->type;
-        if (original_bm->type == FUNC_TYPE_ECHOC) {
-            new_bm->func_ptr.echoc_function = original_bm->func_ptr.echoc_function; // Share EchoC Function definition pointer
-        } else { // FUNC_TYPE_C_BUILTIN
-            new_bm->func_ptr.c_builtin = original_bm->func_ptr.c_builtin; // Share C function pointer
+        copy.as.bound_method_val = original.as.bound_method_val;
+        if (copy.as.bound_method_val) {
+            copy.as.bound_method_val->ref_count++;
+            DEBUG_PRINTF("VALUE_DEEP_COPY: Incremented ref_count for bound method (%p) to %d", (void*)copy.as.bound_method_val, copy.as.bound_method_val->ref_count);
         }
-
-        // If the original bound method owned its self_value, the new one should get a deep copy.
-        // Otherwise, it shares the (borrowed) self_value.
-        if (original_bm->self_is_owned_copy) {
-            new_bm->self_value = value_deep_copy(original_bm->self_value);
-        } else {
-            new_bm->self_value = original_bm->self_value; // Shallow copy of Value struct (shares underlying data)
-        }
-        new_bm->self_is_owned_copy = original_bm->self_is_owned_copy; // Copy ownership flag
-        copy.as.bound_method_val = new_bm;
     } else if ((original.type == VAL_COROUTINE || original.type == VAL_GATHER_TASK) && original.as.coroutine_val != NULL) {
         // For VAL_COROUTINE and VAL_GATHER_TASK, "deep copy" means copying the pointer
         // and incrementing the reference count of the Coroutine struct.
@@ -307,17 +328,51 @@ Value value_deep_copy(Value original) {
     return copy;
 }
 
-// Helper to free a coroutine queue
-void free_coroutine_queue(CoroutineQueueNode* head) {
-    CoroutineQueueNode* current = head;
-    CoroutineQueueNode* next;
-    while (current) {
-        next = current->next;
-        // free_value_contents should be called on the VAL_COROUTINE
-        // before or after removing from queue, if the coroutine itself is being destroyed.
-        // Here, we just free the queue nodes. The coroutines themselves are managed elsewhere.
-        free(current);
-        current = next;
+// Helper to free a coroutine queue and its coroutines.
+// Takes pointers to head and tail to nullify them after processing.
+void robust_free_coroutine_queue(Interpreter* interpreter, CoroutineQueueNode** p_head, CoroutineQueueNode** p_tail) {
+    (void)interpreter; // Mark interpreter as unused for now
+    CoroutineQueueNode* current_node_iter = *p_head;
+    if (!current_node_iter) return;
+
+    // Step 1: Collect all Coroutine pointers from the queue into a temporary buffer.
+    // This avoids issues if free_value_contents indirectly modifies this queue or another.
+    #define MAX_COROS_IN_QUEUE_CLEANUP 1024 // Max coroutines expected in a single queue during cleanup
+    Coroutine* coros_to_process[MAX_COROS_IN_QUEUE_CLEANUP];
+    int coro_collect_count = 0;
+
+    while(current_node_iter && coro_collect_count < MAX_COROS_IN_QUEUE_CLEANUP) {
+        coros_to_process[coro_collect_count++] = current_node_iter->coro;
+        current_node_iter = current_node_iter->next;
+    }
+
+    if (current_node_iter) { // Buffer was too small
+        DEBUG_PRINTF("CRITICAL_WARNING: robust_free_coroutine_queue exceeded temporary buffer for queue at %p. Some coroutines may leak.", (void*)*p_head);
+        // In a production system, this might realloc or use a dynamic list.
+    }
+
+    // Step 2: Free the queue nodes themselves
+    current_node_iter = *p_head; // Reset iterator to original head
+    CoroutineQueueNode* next_queue_node;
+    while (current_node_iter) {
+        next_queue_node = current_node_iter->next;
+        free(current_node_iter);
+        current_node_iter = next_queue_node;
+    }
+    *p_head = NULL; // Nullify the interpreter's head pointer
+    if (p_tail) *p_tail = NULL; // Nullify the interpreter's tail pointer
+
+    // Step 3: Process the collected coroutines for deallocation
+    for (int i = 0; i < coro_collect_count; ++i) {
+        Coroutine* coro_to_free = coros_to_process[i];
+        if (!coro_to_free) continue;
+
+        Value temp_coro_val;
+        temp_coro_val.type = (coro_to_free->gather_tasks ? VAL_GATHER_TASK : VAL_COROUTINE);
+        temp_coro_val.as.coroutine_val = coro_to_free;
+        DEBUG_PRINTF("ROBUST_FREE_QUEUE: Processing coro %s (%p), ref_count before free: %d",
+                     coro_to_free->name ? coro_to_free->name : "unnamed", (void*)coro_to_free, coro_to_free->ref_count);
+        free_value_contents(temp_coro_val); // Decrements ref_count, frees if 0
     }
 }
 
@@ -339,52 +394,55 @@ void free_symbol_nodes(SymbolNode* symbols) {
         if (current->name) {
             free(current->name);
             current->name = NULL; // Good practice
-        }        
+        }
         // The Blueprint struct itself is managed by the interpreter's all_blueprints_head list.
         // For other types, free_value_contents handles their dynamically allocated parts.
         if (!is_self_object_reference) {
             // unless it's a 'self' reference.
-            if (!is_self_object_reference) {
-                free_value_contents(current->value);
-            }
+            // The inner redundant check 'if (!is_self_object_reference)' was removed.
+            free_value_contents(current->value);
         }
         free(current);
         current = next;
     }
 }
 
-// Actual implementation for free_scope (forward declared in header.c)
-void free_scope(Scope* scope) {
-    if (scope) {
-        free_symbol_nodes(scope->symbols); // Free all symbols in this scope
-        free(scope);                       // Free the scope struct itself
-    }
-}
 
 
 int main(int argc, char* argv[]) {
+    char* initial_file_abs_path = NULL;
     #ifdef DEBUG_ECHOC
-    /*
     echoc_debug_log_file = fopen("echoc_runtime_log.txt", "w");
     if (echoc_debug_log_file == NULL) {
         // If file opening fails, BUG_PRINTF/DEBUG_PRINTF will fall back to stderr.
         fprintf(stderr, "CRITICAL: Failed to open echoc_runtime_log.txt for writing. Runtime debug logs will go to stderr.\n");
-    } else {
-        fprintf(echoc_debug_log_file, "--- EchoC Runtime Log Initialized ---\n");
-        setvbuf(echoc_debug_log_file, NULL, _IOLBF, 0); // Line buffering
-        fflush(echoc_debug_log_file);
+    } else { // Change to full buffering for performance
+        setvbuf(echoc_debug_log_file, NULL, _IOFBF, 4096); // Use full buffering with a 4KB buffer
+        fprintf(echoc_debug_log_file, "--- EchoC Runtime Log Initialized ---\n"); // This will be buffered
     }
-    */
     // By keeping echoc_debug_log_file as NULL, no file logging will occur.
     // keep commented out so your CPU won't overload
     #endif
 
     if (argc != 2) {
-        printf("Usage: %s <filename.echoc>\\n", argv[0]);
+        printf("Usage: %s <filename.echoc>\n", argv[0]);
         return 1;
     }
 
-    FILE* file = fopen(argv[1], "r");
+    // Check if the provided path is a file and not a directory.
+    struct stat path_stat;
+    if (stat(argv[1], &path_stat) != 0) {
+        // If stat fails, the file likely doesn't exist or there's a permission issue.
+        // fopen below will also fail, but this gives a slightly better early error.
+        printf("Error: Cannot access path '%s'.\n", argv[1]);
+        return 1;
+    }
+    if (S_ISDIR(path_stat.st_mode)) {
+        printf("Error: Expected a file, but '%s' is a directory.\n", argv[1]);
+        return 1;
+    }
+
+    FILE* file = fopen(argv[1], "rb");
     if (file == NULL) {
         printf("Error: Could not open file '%s'\\n", argv[1]);
         return 1;
@@ -394,14 +452,33 @@ int main(int argc, char* argv[]) {
     long fsize = ftell(file);
     fseek(file, 0, SEEK_SET);
 
+    if (fsize < 0) {
+        fprintf(stderr, "Error: Could not determine size of file '%s'.\n", argv[1]);
+        fclose(file);
+        return 1;
+    }
+
     char* source_code = malloc(fsize + 1);
-    fread(source_code, 1, fsize, file);
-    fclose(file);
-    source_code[fsize] = 0;
+    if (!source_code) {
+        fprintf(stderr, "Error: Could not allocate memory to read file '%s'.\n", argv[1]);
+        fclose(file);
+        return 1;
+    }
 
-    Lexer lexer = { source_code, 0, source_code[0], 1, 1, (size_t)fsize };
+    size_t bytes_read = fread(source_code, 1, fsize, file);
+    fclose(file); // Close file immediately after reading
 
-    char* initial_file_abs_path = realpath(argv[1], NULL);
+    if (bytes_read != (size_t)fsize) {
+        fprintf(stderr, "Error: Failed to read entire file '%s'. Expected %ld bytes, got %zu.\n", argv[1], fsize, bytes_read);
+        free(source_code);
+        return 1;
+    }
+
+    source_code[bytes_read] = '\0'; // Null-terminate based on the actual bytes read
+
+    Lexer lexer = { source_code, 0, source_code[0], 1, 1, bytes_read }; // Use the correct length
+
+    initial_file_abs_path = realpath(argv[1], NULL);
     if (!initial_file_abs_path) {
         fprintf(stderr, "Error: Could not resolve absolute path for input file '%s'\n", argv[1]);
         free(source_code); return 1;
@@ -414,6 +491,7 @@ int main(int argc, char* argv[]) {
         free(source_code);
         return 1;
     }
+    global_scope->id = next_scope_id++;
     global_scope->symbols = NULL;
     global_scope->outer = NULL; // Global scope has no outer scope
 
@@ -433,23 +511,49 @@ int main(int argc, char* argv[]) {
         .try_catch_stack_top = NULL,
         .module_cache = NULL, // Will be initialized by initialize_module_system
         .active_module_scopes_head = NULL, // Initialize new field
+        .current_executing_file_path = strdup(initial_file_abs_path),
         .current_executing_file_directory = get_directory_from_path(initial_file_abs_path),
         .in_try_catch_finally_block_definition = 0, // Initialize to false
         .async_ready_queue_head = NULL,
         .async_ready_queue_tail = NULL,
-        .current_executing_coroutine = NULL,
-        .async_event_loop_active = 0,
-        .coroutine_yielded_for_await = 0
+        .async_sleep_queue_head = NULL, // Initialize new field
+        .async_sleep_queue_tail = NULL, // Initialize new field
+        .current_executing_coroutine = NULL, // Add missing comma here
+        .async_event_loop_active = 0, // Add missing comma here
+        .error_token = NULL, // Initialize new field
+        .unhandled_error_occured = 0, // Initialize new flag
+        .repr_depth_count = 0, // Initialize new field
+        .prevent_side_effects = false, // Initialize new flag
+        .resume_depth = 0, // Initialize async resume depth
     };
+    interpreter.is_dummy_resume_value = false; // Initialize new flag
     free(initial_file_abs_path); // directory path was strdup'd
+    g_interpreter_for_error_reporting = &interpreter;
 
     initialize_module_system(&interpreter);
 
     interpret(&interpreter);
 
+    if (interpreter.unhandled_error_occured) {
+        #ifdef DEBUG_ECHOC
+        print_recent_logs_to_stderr_internal();
+        #endif
+        char* err_str = value_to_string_representation(interpreter.current_exception, &interpreter, interpreter.error_token);
+        const char* file_path = interpreter.current_executing_file_path ? interpreter.current_executing_file_path : "unknown file";
+
+        if (interpreter.error_token) {
+            fprintf(stderr, "[EchoC Unhandled Exception] in %s at line %d, col %d: %s\n", file_path, interpreter.error_token->line, interpreter.error_token->col, err_str);
+        } else {
+            fprintf(stderr, "[EchoC Unhandled Exception] in %s (unknown location): %s\n", file_path, err_str);
+        }
+        free(err_str);
+    }
+
     free_token(interpreter.current_token); // Free the last token (usually EOF)
+    if (interpreter.current_executing_file_path) free(interpreter.current_executing_file_path);
     free_value_contents(interpreter.current_function_return_value); // Free any lingering return value
     free_value_contents(interpreter.current_exception); // Free any unhandled exception
+    if (interpreter.error_token) free_token(interpreter.error_token); // Free error token if set
     free_scope(interpreter.current_scope); // Clean up the (global) scope
 
     // Free all defined blueprints
@@ -471,10 +575,17 @@ int main(int argc, char* argv[]) {
         free(current_bp_node); // Free the list node
         current_bp_node = next_bp_node;
     }
+    
+    // Loop to ensure all coroutines are processed, even if freeing one queue adds to another.
+    while (interpreter.async_ready_queue_head || interpreter.async_sleep_queue_head) {
+        if (interpreter.async_ready_queue_head) {
+            robust_free_coroutine_queue(&interpreter, &interpreter.async_ready_queue_head, &interpreter.async_ready_queue_tail);
+        }
+        if (interpreter.async_sleep_queue_head) {
+            robust_free_coroutine_queue(&interpreter, &interpreter.async_sleep_queue_head, &interpreter.async_sleep_queue_tail);
+        }
+    }
 
-    // Free any remaining coroutines in the ready queue
-    // (This assumes coroutines themselves are freed via free_value_contents when their VAL_COROUTINE Value is freed)
-    free_coroutine_queue(interpreter.async_ready_queue_head);
     cleanup_module_system(&interpreter); // Clean up module cache and related resources
 
     #ifdef DEBUG_ECHOC
@@ -488,5 +599,5 @@ int main(int argc, char* argv[]) {
     */
     #endif
     free(source_code);
-    return 0;
+    return interpreter.unhandled_error_occured ? 1 : 0;
 }

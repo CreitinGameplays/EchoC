@@ -4,6 +4,7 @@
 #include "statement_parser.h"  // For interpret_statement
 #include "scope.h"             // For Scope operations
 #include "dictionary.h"        // For Dictionary operations
+#include "modules/weaver.h"    // For create_weaver_module
 #include <limits.h>            // For PATH_MAX (may need to include unistd.h for realpath on POSIX)
 #include <errno.h>
 #ifndef _WIN32
@@ -20,6 +21,38 @@ static Value execute_module_file_and_get_exports(Interpreter* interpreter, const
 static char* search_in_directory(const char* dir, const char* module_name, Token* error_token);
 static char* get_echoc_executable_directory();
 
+Value get_or_create_builtin_module(Interpreter* interpreter, const char* module_name, Token* error_token) {
+    Value cached_val;
+    // Use a prefix for built-in modules in the cache to avoid name collisions with files.
+    char cache_key[256];
+    snprintf(cache_key, sizeof(cache_key), "__builtin__:%s", module_name);
+
+    if (dictionary_try_get(interpreter->module_cache, cache_key, &cached_val, true)) {
+        return cached_val;
+    }
+
+    Value module_val;
+    bool found = false;
+
+    if (strcmp(module_name, "weaver") == 0) {
+        module_val = create_weaver_module(interpreter);
+        found = true;
+    }
+    // Add other built-in modules here with `else if`
+
+    if (!found) {
+        // This should not be reached if called correctly from interpret_load_statement
+        report_error("Internal", "Attempted to load unknown built-in module.", error_token);
+    }
+
+    // Cache the newly created module
+    dictionary_set(interpreter->module_cache, cache_key, module_val, error_token);
+
+    // Return a deep copy for the caller to use, for consistency with file-based modules.
+    Value return_val = value_deep_copy(module_val);
+    free_value_contents(module_val); // Free the original created module, as it's now copied in the cache and for the return value.
+    return return_val;
+}
 
 void initialize_module_system(Interpreter* interpreter) {
     interpreter->module_cache = dictionary_create(16, NULL); // Initial size, error token not critical here
@@ -139,7 +172,7 @@ static char* search_in_directory(const char* dir, const char* module_name, Token
     if (GetFullPathNameA(temp_path_ecc, PATH_MAX, full_path_buffer, NULL) != 0) {
         DWORD dwAttrib = GetFileAttributesA(full_path_buffer);
         if (dwAttrib != INVALID_FILE_ATTRIBUTES && !(dwAttrib & FILE_ATTRIBUTE_DIRECTORY)) {
-            FILE* f = fopen(full_path_buffer, "r"); // Check if it's readable
+            FILE* f = fopen(full_path_buffer, "rb"); // Check if it's readable
             if (f) { fclose(f); resolved_path_alloc = strdup(full_path_buffer); }
         }
     }
@@ -147,7 +180,7 @@ static char* search_in_directory(const char* dir, const char* module_name, Token
     if (realpath(temp_path_ecc, full_path_buffer)) {
         struct stat path_stat;
         if (stat(full_path_buffer, &path_stat) == 0 && S_ISREG(path_stat.st_mode)) {
-            FILE* f = fopen(full_path_buffer, "r"); // Check if it's readable
+            FILE* f = fopen(full_path_buffer, "rb"); // Check if it's readable
             if (f) { fclose(f); resolved_path_alloc = strdup(full_path_buffer); }
         }
     }
@@ -169,7 +202,7 @@ static char* search_in_directory(const char* dir, const char* module_name, Token
     if (realpath(temp_path_as_is, full_path_buffer)) {
         struct stat path_stat;
         if (stat(full_path_buffer, &path_stat) == 0 && S_ISREG(path_stat.st_mode)) {
-            FILE* f = fopen(full_path_buffer, "r"); // Check if it's readable
+            FILE* f = fopen(full_path_buffer, "rb"); // Check if it's readable
             if (f) { fclose(f); resolved_path_alloc = strdup(full_path_buffer); }
         }
     }
@@ -265,7 +298,7 @@ Value load_module_from_path(Interpreter* interpreter, const char* absolute_modul
 }
 
 static Value execute_module_file_and_get_exports(Interpreter* interpreter, const char* absolute_module_path, Token* error_token) {
-    FILE* file = fopen(absolute_module_path, "r");
+    FILE* file = fopen(absolute_module_path, "rb");
     if (!file) {
         char err_msg[PATH_MAX + 100];
         snprintf(err_msg, sizeof(err_msg), "Could not open module file '%s'. Error: %s", absolute_module_path, strerror(errno));
@@ -305,6 +338,7 @@ static Value execute_module_file_and_get_exports(Interpreter* interpreter, const
     Scope* module_scope = malloc(sizeof(Scope));
     if (!module_scope) { free(source_code); report_error("System", "Failed to allocate scope for module.", error_token); }
     module_scope->symbols = NULL;
+    module_scope->id = next_scope_id++;
     module_scope->outer = NULL; // Modules have their own independent global scope.
                                 // A "builtins" scope could be implicitly outer to this if desired later.
 
@@ -312,11 +346,13 @@ static Value execute_module_file_and_get_exports(Interpreter* interpreter, const
     Lexer* old_lexer = interpreter->lexer;
     Token* old_token = interpreter->current_token;
     Scope* old_scope = interpreter->current_scope;
+    char* old_exec_path = interpreter->current_executing_file_path;
     char* old_exec_dir = interpreter->current_executing_file_directory;
 
     interpreter->lexer = &module_lexer;
     interpreter->current_token = get_next_token(interpreter->lexer);
     interpreter->current_scope = module_scope;
+    interpreter->current_executing_file_path = strdup(absolute_module_path);
     interpreter->current_executing_file_directory = get_directory_from_path(absolute_module_path);
 
     // Add module_scope to the list of active module scopes
@@ -353,6 +389,8 @@ static Value execute_module_file_and_get_exports(Interpreter* interpreter, const
     interpreter->lexer = old_lexer;
     interpreter->current_token = old_token;
     interpreter->current_scope = old_scope;
+    if (interpreter->current_executing_file_path) free(interpreter->current_executing_file_path);
+    interpreter->current_executing_file_path = old_exec_path;
     if (interpreter->current_executing_file_directory) free(interpreter->current_executing_file_directory);
     interpreter->current_executing_file_directory = old_exec_dir;
 

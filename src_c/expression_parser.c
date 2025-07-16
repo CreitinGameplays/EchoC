@@ -2,10 +2,11 @@
 #include "statement_parser.h" // For interpret_statement declaration
 #include "parser_utils.h"     // For interpreter_eat
 #include "scope.h"            // For symbol_table_get
-#include "value_utils.h"      // For evaluate_interpolated_string, value_to_string_representation
+#include "value_utils.h"      // For DynamicString helpers (ds_init, ds_append_str, ds_finalize)
 #include "dictionary.h"       // For dictionary_create, dictionary_set, dictionary_get
 #include "modules/builtins.h" // For builtin_slice
-#include "module_loader.h"    // <-- Added: for resolve_module_path and load_module_from_path
+#include "module_loader.h"    // Added: for resolve_module_path and load_module_from_path
+#include "interpreter.h"      // For add_to_ready_queue
 
 #include <string.h>
 #include <stdlib.h>
@@ -16,90 +17,828 @@
 // interpret_funct, interpret_return, etc.) are defined in statement_parser.c.
 // Expression parser relies on statement_parser.h for interpret_statement if needed (e.g. in execute_echoc_function).
 
-extern void add_to_ready_queue(Interpreter* interpreter, Coroutine* coro); // From interpreter.c (via interpreter.h)
-extern void run_event_loop(Interpreter* interpreter); // From interpreter.c (via interpreter.h)
-
-/*
-StatementExecStatus interpret_statement(Interpreter* interpreter) {
-    DEBUG_PRINTF("INTERPRET_STATEMENT: Token type: %s, value: '%s'. Current scope: %p",
-                 token_type_to_string(interpreter->current_token->type), //
-                 interpreter->current_token->value ? interpreter->current_token->value : "N/A", //
-                 (void*)interpreter->current_scope); //
-    // Skip extra COLON tokens if they occur between statements.
-    // Skip if in event loop but no current coroutine and queue is empty (event loop should handle this)
-    if (interpreter->async_event_loop_active && !interpreter->current_executing_coroutine && interpreter->async_ready_queue_head == NULL) return STATEMENT_EXECUTED_OK;
-
-    while (interpreter->current_token->type == TOKEN_COLON && interpreter->current_token->type != TOKEN_EOF) {
-        interpreter_eat(interpreter, TOKEN_COLON);
-    }
-
-    if (interpreter->exception_is_active) { // If a statement raised an exception, propagate it
-        return STATEMENT_PROPAGATE_FLAG; // Return appropriate status
-    }
-
-    StatementExecStatus status = STATEMENT_EXECUTED_OK;
-    // Now process the statement.
-    if (interpreter->current_token->type == TOKEN_SHOW) {
-        interpret_show_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_RUN) {
-        interpret_run_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_LET) {
-        interpret_let_statement(interpreter); // This already eats its trailing colon
-        return status; // Let statement handles its own trailing colon
-    } else if (interpreter->current_token->type == TOKEN_ASYNC) { // Handle 'async funct'
-        interpreter_eat(interpreter, TOKEN_ASYNC);
-        if (interpreter->current_token->type != TOKEN_FUNCT) report_error_unexpected_token(interpreter, "'funct' after 'async'");
-        interpret_funct_statement(interpreter); // interpret_funct_statement will know it's async
-    } else if (interpreter->current_token->type == TOKEN_FUNCT) {
-        interpret_funct_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_RETURN) {
-        interpret_return_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_IF) {
-        interpret_if_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_LOOP) {
-        interpret_loop_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_BREAK) {
-        interpret_break_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_CONTINUE) {
-        interpret_continue_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_LBRACE) {
-        interpret_block_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_RAISE) {
-        if (!interpreter->in_try_catch_finally_block_definition) {
-            report_error("Syntax", "'raise:' statement can only be used lexically inside a 'try', 'catch', or 'finally' block.", interpreter->current_token);
-        }
-        interpret_raise_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_TRY) {
-        interpret_try_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_BLUEPRINT) {
-        interpret_blueprint_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_LOAD) {
-        interpret_load_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_ID ||
-               interpreter->current_token->type == TOKEN_SUPER) { // Allow 'super' to start an expression statement
-        interpret_expression_statement(interpreter); // This already eats its trailing colon
-        return status; // Expression statement handles its own trailing colon
-    } else if (interpreter->current_token->type == TOKEN_EOF) {
-        return status; // End of file, do nothing
-    } else {
-        report_error_unexpected_token(interpreter, "a statement keyword (show, let, assign, funct, return, if, loop, etc.), an identifier (for a function call), or an opening brace '{'");
-    }
-
-    if (interpreter->coroutine_yielded_for_await) {
-        status = STATEMENT_YIELDED_AWAIT;
-    } else if (interpreter->break_flag || interpreter->continue_flag || interpreter->return_flag || interpreter->exception_is_active) {
-        status = STATEMENT_PROPAGATE_FLAG;
-    }
-    return status;
-}
-*/
-
 Value interpret_instance_creation(Interpreter* interpreter, Blueprint* bp_to_instantiate, Token* call_site_token); // Made non-static
 
 static void coroutine_add_waiter(Coroutine* self, Coroutine* waiter_coro_to_add); // Moved forward declaration earlier
 
-// static Value interpret_method_call(Interpreter* interpreter, Object* self_obj, Function* method_func, Token* call_site_token); // Marked as unused
-// Value call_bound_method_with_args(Interpreter* interpreter, BoundMethod* bm, Value* call_args, int arg_count, Token* call_site_token); // Replaced
+// Forward declarations for deep equality helpers
+static bool array_deep_equal(Interpreter* interpreter, Array* arr1, Array* arr2, Token* error_token);
+static bool tuple_deep_equal(Interpreter* interpreter, Tuple* tup1, Tuple* tup2, Token* error_token);
+static bool dictionary_deep_equal(Interpreter* interpreter, Dictionary* dict1, Dictionary* dict2, Token* error_token);
+static bool values_are_deep_equal(Interpreter* interpreter, Value v1, Value v2, Token* error_token);
+static bool values_are_identical(Value v1, Value v2);
+bool value_is_truthy(Value v); // Declaration for use within this file
+
+// Forward declarations for other moved helper functions
+Value interpret_dictionary_literal(Interpreter* interpreter);
+static void parse_call_arguments_with_named(Interpreter* interpreter, ParsedArgument args_out[], int* arg_count_out, int max_args, Token* call_site_token_for_errors);
+
+// Helper to check if a function name is a built-in
+static bool is_builtin_function(const char* name) {
+    if (strcmp(name, "slice") == 0 ||
+        strcmp(name, "show") == 0 ||
+        strcmp(name, "type") == 0) {
+        return true;
+    }
+    return false;
+}
+
+// Moved helper functions (definitions)
+static bool array_deep_equal(Interpreter* interpreter, Array* arr1, Array* arr2, Token* error_token) {
+    if (arr1 == arr2) return true; // Same instance
+    if (!arr1 || !arr2) return false; // One is null
+    if (arr1->count != arr2->count) return false;
+    for (int i = 0; i < arr1->count; ++i) {
+        if (!values_are_deep_equal(interpreter, arr1->elements[i], arr2->elements[i], error_token)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool tuple_deep_equal(Interpreter* interpreter, Tuple* tup1, Tuple* tup2, Token* error_token) {
+    if (tup1 == tup2) return true; // Same instance
+    if (!tup1 || !tup2) return false; // One is null
+    if (tup1->count != tup2->count) return false;
+    for (int i = 0; i < tup1->count; ++i) {
+        if (!values_are_deep_equal(interpreter, tup1->elements[i], tup2->elements[i], error_token)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool dictionary_deep_equal(Interpreter* interpreter, Dictionary* dict1, Dictionary* dict2, Token* error_token) {
+    if (dict1 == dict2) return true; // Same instance
+    if (!dict1 || !dict2) return false; // One is null
+    if (dict1->count != dict2->count) return false;
+
+    for (int i = 0; i < dict1->num_buckets; ++i) {
+        DictEntry* entry1 = dict1->buckets[i];
+        while (entry1) {
+            Value val2;
+            // dictionary_try_get with false for deep_copy as we only need to compare
+            if (!dictionary_try_get(dict2, entry1->key, &val2, false)) {
+                return false; // Key from dict1 not in dict2
+            }
+            // Now val2 holds a shallow copy of the value from dict2.
+            // We need to recursively compare entry1->value and val2.
+            if (!values_are_deep_equal(interpreter, entry1->value, val2, error_token)) {
+                // Note: if val2 was a complex type and dictionary_try_get did not deep copy,
+                // its contents are not owned by val2 here. This is fine for comparison.
+                return false;
+            }
+            entry1 = entry1->next;
+        }
+    }
+    return true;
+}
+
+static bool values_are_deep_equal(Interpreter* interpreter, Value v1, Value v2, Token* error_token) {
+    if (v1.type != v2.type) {
+        // Special case: allow int/float comparison
+        if ((v1.type == VAL_INT && v2.type == VAL_FLOAT) || (v1.type == VAL_FLOAT && v2.type == VAL_INT)) {
+            double d1 = (v1.type == VAL_INT) ? (double)v1.as.integer : v1.as.floating;
+            double d2 = (v2.type == VAL_INT) ? (double)v2.as.integer : v2.as.floating;
+            return d1 == d2;
+        }
+        return false; // Different types are generally not equal
+    }
+
+    switch (v1.type) {
+        case VAL_INT:
+            return v1.as.integer == v2.as.integer;
+        case VAL_FLOAT:
+            return v1.as.floating == v2.as.floating;
+        case VAL_STRING:
+            if (v1.as.string_val == NULL && v2.as.string_val == NULL) return true;
+            if (v1.as.string_val == NULL || v2.as.string_val == NULL) return false;
+            return strcmp(v1.as.string_val, v2.as.string_val) == 0;
+        case VAL_BOOL:
+            return v1.as.bool_val == v2.as.bool_val;
+        case VAL_NULL:
+            return true; // null is always equal to null
+        case VAL_ARRAY:
+            return array_deep_equal(interpreter, v1.as.array_val, v2.as.array_val, error_token);
+        case VAL_TUPLE:
+            return tuple_deep_equal(interpreter, v1.as.tuple_val, v2.as.tuple_val, error_token);
+        case VAL_DICT:
+            return dictionary_deep_equal(interpreter, v1.as.dict_val, v2.as.dict_val, error_token);
+        case VAL_FUNCTION:
+            // Functions are equal if they are the same instance (pointer equality)
+            return v1.as.function_val == v2.as.function_val;
+        case VAL_BLUEPRINT:
+            // Blueprints are equal if they are the same instance
+            return v1.as.blueprint_val == v2.as.blueprint_val;
+        case VAL_OBJECT:
+            // Objects are generally considered equal only if they are the same instance.
+            // Deep content equality for objects would require comparing all instance attributes,
+            // which could be complex and might not be desired default behavior.
+            return v1.as.object_val == v2.as.object_val;
+        case VAL_COROUTINE: // Intentional fall-through
+        case VAL_GATHER_TASK:
+            return v1.as.coroutine_val == v2.as.coroutine_val; // Pointer equality
+        default:
+            return false; // Unknown or unhandled types are not equal
+    }
+}
+
+static bool values_are_identical(Value v1, Value v2) {
+    if (v1.type != v2.type) {
+        return false;
+    }
+
+    switch (v1.type) {
+        case VAL_INT:
+            return v1.as.integer == v2.as.integer;
+        case VAL_FLOAT:
+            return v1.as.floating == v2.as.floating;
+        case VAL_BOOL:
+            return v1.as.bool_val == v2.as.bool_val;
+        case VAL_NULL:
+            return true;
+        case VAL_STRING:
+            return v1.as.string_val == v2.as.string_val;
+        case VAL_ARRAY:
+            return v1.as.array_val == v2.as.array_val;
+        case VAL_TUPLE:
+            return v1.as.tuple_val == v2.as.tuple_val;
+        case VAL_DICT:
+            return v1.as.dict_val == v2.as.dict_val;
+        case VAL_FUNCTION:
+            return v1.as.function_val == v2.as.function_val;
+        case VAL_BLUEPRINT:
+            return v1.as.blueprint_val == v2.as.blueprint_val;
+        case VAL_OBJECT:
+            return v1.as.object_val == v2.as.object_val;
+        case VAL_BOUND_METHOD:
+            return v1.as.bound_method_val == v2.as.bound_method_val;
+        case VAL_COROUTINE: // Intentional fall-through
+        case VAL_GATHER_TASK:
+            return v1.as.coroutine_val == v2.as.coroutine_val; // Pointer equality
+        default:
+            return false;
+    }
+}
+
+bool value_is_truthy(Value v) {
+    switch (v.type) {
+        case VAL_NULL:
+            return false;
+        case VAL_BOOL:
+            return v.as.bool_val;
+        case VAL_INT:
+            return v.as.integer != 0;
+        case VAL_FLOAT:
+            return v.as.floating != 0.0;
+        case VAL_STRING:
+            return v.as.string_val[0] != '\0'; // Check if not empty string
+        case VAL_ARRAY:
+            return v.as.array_val->count > 0;
+        case VAL_TUPLE:
+            return v.as.tuple_val->count > 0;
+        case VAL_DICT:
+            return v.as.dict_val->count > 0;
+        // All other types are considered "truthy" by default
+        case VAL_FUNCTION:
+        case VAL_BLUEPRINT:
+        case VAL_OBJECT:
+        case VAL_BOUND_METHOD:
+        case VAL_COROUTINE:
+        case VAL_GATHER_TASK:
+        case VAL_SUPER_PROXY:
+            return true;
+        default:
+            return false; // Should not happen
+    }
+}
+
+static void coroutine_add_waiter(Coroutine* self, Coroutine* waiter_coro_to_add) {
+    CoroutineWaiterNode* new_node = malloc(sizeof(CoroutineWaiterNode));
+    if (!new_node) {
+        report_error("System", "Failed to allocate CoroutineWaiterNode.", NULL);
+    }
+    new_node->waiter_coro = waiter_coro_to_add;
+    new_node->next = NULL;
+
+    // Append to the list of waiters
+    if (self->waiters_head == NULL) {
+        self->waiters_head = new_node;
+    } else {
+        CoroutineWaiterNode* current = self->waiters_head;
+        while (current->next != NULL) {
+            current = current->next;
+        }
+        current->next = new_node;
+    }
+    // The waiter_coro_to_add's ref_count is NOT incremented here.
+    // The link is considered weak for ref_counting purposes to avoid cycles.
+    DEBUG_PRINTF("COROUTINE_ADD_WAITER: Coro %s (%p) added as waiter to %s (%p). RefCount: %d",
+                 waiter_coro_to_add->name ? waiter_coro_to_add->name : "unnamed_waiter",
+                 (void*)waiter_coro_to_add,
+                 self->name ? self->name : "unnamed_target",
+                 (void*)self,
+                 waiter_coro_to_add ? waiter_coro_to_add->ref_count : 0);
+}
+
+Value interpret_dictionary_literal(Interpreter* interpreter) {
+    Token* lbrace_token = interpreter->current_token;
+    interpreter_eat(interpreter, TOKEN_LBRACE);
+    Dictionary* dict = dictionary_create(16, lbrace_token);
+    
+	if (interpreter->current_token->type != TOKEN_RBRACE) {
+		while (1) {
+			ExprResult key_res = interpret_expression(interpreter);
+			if (interpreter->exception_is_active) {
+				if (key_res.is_freshly_created_container) free_value_contents(key_res.value);
+				Value temp_dict_val_to_free = { .type = VAL_DICT, .as.dict_val = dict };
+			    free_value_contents(temp_dict_val_to_free);
+				return create_null_value();
+			}
+			Value key = key_res.value;
+			if (key.type != VAL_STRING) {
+				Value temp_dict_val_to_free = { .type = VAL_DICT, .as.dict_val = dict };
+				free_value_contents(temp_dict_val_to_free);
+				if (key_res.is_freshly_created_container) free_value_contents(key);
+				report_error("Syntax", "Dictionary keys must be (or evaluate to) strings.", interpreter->current_token);
+                return create_null_value(); // Unreachable, but for consistency
+			}
+			interpreter_eat(interpreter, TOKEN_COLON);
+			ExprResult value_res = interpret_expression(interpreter);
+			if (interpreter->exception_is_active) {
+				if (value_res.is_freshly_created_container) free_value_contents(value_res.value);
+				if (key_res.is_freshly_created_container) free_value_contents(key);
+				Value temp_dict_val_to_free = { .type = VAL_DICT, .as.dict_val = dict };
+				free_value_contents(temp_dict_val_to_free);
+				return create_null_value();
+			}
+			dictionary_set(dict, key.as.string_val, value_res.value, interpreter->current_token);
+			if (key_res.is_freshly_created_container) free_value_contents(key);
+			if (value_res.is_freshly_created_container) free_value_contents(value_res.value);
+			if (interpreter->current_token->type == TOKEN_RBRACE) break;
+			interpreter_eat(interpreter, TOKEN_COMMA);
+		}
+	}
+    
+    interpreter_eat(interpreter, TOKEN_RBRACE);
+    Value val;
+    val.type = VAL_DICT;
+    val.as.dict_val = dict;
+    return val;
+}
+
+static void parse_call_arguments_with_named(
+    Interpreter* interpreter,
+    ParsedArgument args_out[],
+    int* arg_count_out,
+    int max_args,
+    Token* call_site_token_for_errors
+) {
+    *arg_count_out = 0;
+    bool named_args_started = false;
+
+    if (interpreter->current_token->type != TOKEN_RPAREN) {
+        do {
+            if (*arg_count_out >= max_args) {
+                report_error("Syntax", "Exceeded maximum number of function arguments (10).", call_site_token_for_errors);
+            }
+
+            // Peek ahead to see if it's a named argument (ID = ...)
+            Token* peeked_token = NULL;
+            bool is_named_arg = false;
+            if (interpreter->current_token->type == TOKEN_ID) {
+                peeked_token = peek_next_token(interpreter->lexer);
+                if (peeked_token && peeked_token->type == TOKEN_ASSIGN) {
+                    is_named_arg = true;
+                }
+            }
+
+            if (is_named_arg) {
+                named_args_started = true;
+                
+                args_out[*arg_count_out].name = strdup(interpreter->current_token->value);
+                interpreter_eat(interpreter, TOKEN_ID);
+                interpreter_eat(interpreter, TOKEN_ASSIGN);
+                
+                ExprResult arg_expr_res = interpret_expression(interpreter);
+                args_out[*arg_count_out].value = arg_expr_res.value;
+                args_out[*arg_count_out].is_fresh = arg_expr_res.is_freshly_created_container;
+                // START FIX: Check for exception or yield during argument evaluation
+                if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+                    // An exception occurred while evaluating an argument.
+                    // The argument value might be a partial/dummy value.
+                    // The caller (interpret_any_function_call) will see the exception flag and handle cleanup.
+                    if (peeked_token) free_token(peeked_token);
+                    return; // Exit argument parsing immediately.
+                }
+                // END FIX
+            } else {
+                if (named_args_started) {
+                    if (peeked_token) free_token(peeked_token);
+                    report_error("Syntax", "Positional argument follows named argument.", interpreter->current_token);
+                }
+                
+                args_out[*arg_count_out].name = NULL;
+                
+                ExprResult arg_expr_res = interpret_expression(interpreter);
+                args_out[*arg_count_out].value = arg_expr_res.value;
+                args_out[*arg_count_out].is_fresh = arg_expr_res.is_freshly_created_container;
+
+                // START FIX: Check for exception or yield during argument evaluation
+                if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+                    // An exception occurred while evaluating an argument.
+                    // The argument value might be a partial/dummy value.
+                    // The caller (interpret_any_function_call) will see the exception flag and handle cleanup.
+                    if (peeked_token) free_token(peeked_token);
+                    return; // Exit argument parsing immediately.
+                }
+                // END FIX
+            }
+
+            if (peeked_token) {
+                free_token(peeked_token);
+            }
+
+            (*arg_count_out)++;
+
+            if (interpreter->current_token->type == TOKEN_COMMA) {
+                interpreter_eat(interpreter, TOKEN_COMMA);
+                if (interpreter->current_token->type == TOKEN_RPAREN) {
+                    report_error("Syntax", "Trailing comma in argument list.", interpreter->current_token);
+                }
+            } else {
+                break;
+            }
+        } while (interpreter->current_token->type != TOKEN_RPAREN && interpreter->current_token->type != TOKEN_EOF);
+    }
+
+    interpreter_eat(interpreter, TOKEN_RPAREN);
+}
+
+Value interpret_any_function_call(Interpreter* interpreter, const char* func_name_str_or_null_for_bound, Token* func_name_token_for_error_reporting, Value* bound_method_val_or_null) {
+    // This function is called after the ID (func_name or method_name) has been processed
+    // and TOKEN_LPAREN is the current token. It will consume LPAREN, args, RPAREN.
+    
+    // START: Short-circuit check
+    if (interpreter->prevent_side_effects) {
+        interpreter_eat(interpreter, TOKEN_LPAREN);
+        // We must still parse arguments to advance the lexer, but they will also be in "dry-run" mode.
+        ParsedArgument parsed_args[10];
+        int arg_count = 0;
+        parse_call_arguments_with_named(interpreter, parsed_args, &arg_count, 10, func_name_token_for_error_reporting);
+        // The argument names are heap-allocated and must be freed. The values are dummies.
+        for (int i = 0; i < arg_count; ++i) {
+            if (parsed_args[i].name) free(parsed_args[i].name);
+            if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+        }
+        return create_null_value();
+    }
+    // END: Short-circuit check
+
+    DEBUG_PRINTF("ANY_FUNC_CALL_START: Func name '%s', Current token before LPAREN eat: %s ('%s')",
+                 func_name_str_or_null_for_bound ? func_name_str_or_null_for_bound : (bound_method_val_or_null ? "BOUND_METHOD" : "NULL_NAME"),
+                 token_type_to_string(interpreter->current_token->type),
+                 interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+
+    interpreter_eat(interpreter, TOKEN_LPAREN); // Consume '('
+
+    ParsedArgument parsed_args[10];
+    int arg_count = 0;
+    parse_call_arguments_with_named(interpreter, parsed_args, &arg_count, 10, func_name_token_for_error_reporting);
+
+    // If an argument expression yielded or raised an exception, we must stop and propagate.
+    // The arguments that were parsed will be re-evaluated on resume (for yield) or are now irrelevant (for exception).
+    if ((interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) || interpreter->exception_is_active) {
+        // Clean up any arguments that were successfully parsed before the yield/exception.
+        for (int i = 0; i < arg_count; ++i) {
+            if (parsed_args[i].name) free(parsed_args[i].name);
+            if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+        }
+        // Return a dummy value; the caller will see the yield/exception state in the interpreter.
+        return create_null_value();
+    }
+
+    Value result;
+
+    if (bound_method_val_or_null && bound_method_val_or_null->type == VAL_BOUND_METHOD) {
+        BoundMethod* bm = bound_method_val_or_null->as.bound_method_val;
+        if (bm->type == FUNC_TYPE_C_BUILTIN && bm->func_ptr.c_builtin == builtin_append) {
+            // For C builtins, convert ParsedArgument to simple Value array and disallow named args.
+            Value final_args_for_c_builtin[11]; // self + max 10 args
+            final_args_for_c_builtin[0] = bm->self_value; // Array is self
+            for (int i = 0; i < arg_count; ++i) {
+                if (parsed_args[i].name) report_error("Runtime", "Built-in method 'append' does not support named arguments.", func_name_token_for_error_reporting);
+                final_args_for_c_builtin[i+1] = parsed_args[i].value;
+            }
+            result = builtin_append(interpreter, final_args_for_c_builtin, arg_count + 1, func_name_token_for_error_reporting);
+            // Cleanup parsed_args
+            for (int i = 0; i < arg_count; ++i) {
+                if (parsed_args[i].name) free(parsed_args[i].name);
+                if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+            }
+        } else if (bm->type == FUNC_TYPE_ECHOC) { // Regular EchoC method
+            Object* self_obj_ptr = NULL;
+            Function* func_to_run = bm->func_ptr.echoc_function;
+
+            if (bm->self_value.type == VAL_OBJECT) {
+                self_obj_ptr = bm->self_value.as.object_val;
+            } else {
+                for (int i = 0; i < arg_count; ++i) {
+                    if (parsed_args[i].name) free(parsed_args[i].name);
+                    if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                }
+                report_error("Internal", "Bound method 'self' is not an object for a non-builtin method call.", func_name_token_for_error_reporting);
+            }
+
+            if (func_to_run->is_async) {
+                // --- ASYNC METHOD CALL ---
+                Coroutine* coro = calloc(1, sizeof(Coroutine));
+                if (!coro) {
+                    for (int i = 0; i < arg_count; ++i) {
+                        if (parsed_args[i].name) free(parsed_args[i].name);
+                        if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                    }
+                    report_error("System", "Failed to allocate Coroutine object for async method.", func_name_token_for_error_reporting);
+                }
+                coro->magic_number = COROUTINE_MAGIC;
+                coro->creation_line = func_name_token_for_error_reporting->line;
+                coro->creation_col = func_name_token_for_error_reporting->col;
+                coro->function_def = func_to_run;
+                coro->ref_count = 1;
+                coro->statement_resume_state = func_to_run->body_start_state;
+                coro->statement_resume_state.text = func_to_run->source_text_owned_copy;
+                coro->statement_resume_state.text_length = func_to_run->source_text_length;
+
+                Scope* old_interpreter_scope = interpreter->current_scope;
+                interpreter->current_scope = func_to_run->definition_scope;
+                enter_scope(interpreter);
+                coro->execution_scope = interpreter->current_scope;
+
+                // Manually insert 'self' into the new coroutine's scope
+                SymbolNode* self_node = (SymbolNode*)malloc(sizeof(SymbolNode));
+                if (!self_node) { /* error handling */ }
+                self_node->name = strdup("self");
+                self_node->value.type = VAL_OBJECT;
+                self_node->value.as.object_val = self_obj_ptr;
+                self_node->next = coro->execution_scope->symbols;
+                coro->execution_scope->symbols = self_node;
+
+                // Argument handling for async methods
+                int self_offset = 1; // 'self' is param 0
+                int non_self_param_count = func_to_run->param_count - self_offset;
+
+                int min_required_args = 0;
+                for (int i = self_offset; i < func_to_run->param_count; ++i) {
+                    if (!func_to_run->params[i].default_value) min_required_args++;
+                }
+
+                if (arg_count < min_required_args || arg_count > non_self_param_count) {
+                    exit_scope(interpreter); // This frees coro->execution_scope
+                    interpreter->current_scope = old_interpreter_scope;
+                    free(coro); // Free the coroutine struct itself
+                    for (int i = 0; i < arg_count; ++i) {
+                        if (parsed_args[i].name) free(parsed_args[i].name);
+                        if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                    }
+                    char err_msg[250];
+                    snprintf(err_msg, sizeof(err_msg), "Async method '%s' expects %d arguments (%d required), but %d were given.",
+                             func_to_run->name, non_self_param_count, min_required_args, arg_count);
+                    report_error("Runtime", err_msg, func_name_token_for_error_reporting);
+                }
+
+                // Set provided arguments
+                for (int i = 0; i < arg_count; ++i) {
+                    symbol_table_set(coro->execution_scope, func_to_run->params[i + self_offset].name, parsed_args[i].value);
+                }
+
+                // Set default values for remaining parameters
+                for (int i = arg_count; i < non_self_param_count; ++i) {
+                    int param_idx = i + self_offset;
+                    if (func_to_run->params[param_idx].default_value) {
+                        symbol_table_set(coro->execution_scope, func_to_run->params[param_idx].name, *(func_to_run->params[param_idx].default_value));
+                    }
+                }
+
+                // Cleanup parsed args
+                for (int i = 0; i < arg_count; ++i) {
+                    if (parsed_args[i].name) free(parsed_args[i].name);
+                    if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                }
+
+                interpreter->current_scope = old_interpreter_scope;
+
+                coro->name = strdup(func_to_run->name);
+                coro->state = CORO_NEW;
+                coro->result_value = create_null_value();
+                coro->exception_value = create_null_value();
+                coro->value_from_await = create_null_value();
+                coro->gather_first_exception_idx = -1;
+                coro->try_catch_stack_top = NULL;
+                coro->has_yielding_await_state = false;
+                coro->yielding_await_token = NULL;
+
+                result.type = VAL_COROUTINE;
+                result.as.coroutine_val = coro;
+            } else {
+                // --- SYNC METHOD CALL ---
+                result = execute_echoc_function(interpreter, func_to_run, self_obj_ptr, parsed_args, arg_count, func_name_token_for_error_reporting);
+            }
+        } else {
+            report_error("Internal", "Unknown bound method type in call.", func_name_token_for_error_reporting);
+        }
+    }
+    // =================== START: ADD THIS NEW BLOCK ===================
+    else if (bound_method_val_or_null && bound_method_val_or_null->type == VAL_FUNCTION) {
+        // This handles calls to already-resolved functions (e.g., static methods).
+        Function* func_to_run = bound_method_val_or_null->as.function_val;
+
+        // The following logic is copied from the name-lookup path in the 'else' block below.
+        if (func_to_run->is_async) {
+            // Use calloc to ensure all fields are zero-initialized (e.g. is_cancelled, pointers)
+            Coroutine* coro = calloc(1, sizeof(Coroutine));
+            if (!coro) {
+                for (int i = 0; i < arg_count; ++i) {
+                    if (parsed_args[i].name) free(parsed_args[i].name);
+                    if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                }
+                report_error("System", "Failed to allocate Coroutine object.", func_name_token_for_error_reporting);
+            }
+            coro->magic_number = COROUTINE_MAGIC;
+            coro->creation_line = func_name_token_for_error_reporting->line;
+            coro->creation_col = func_name_token_for_error_reporting->col;
+            coro->function_def = func_to_run;
+            coro->ref_count = 1;
+            coro->statement_resume_state = func_to_run->body_start_state;
+            coro->statement_resume_state.text = func_to_run->source_text_owned_copy;
+            coro->statement_resume_state.text_length = func_to_run->source_text_length;
+            DEBUG_PRINTF("CORO_CREATE (Resolved VAL_FUNCTION): Initialized ref_count for %s (%p) to 1", func_to_run->name, (void*)coro);
+
+            Scope* old_interpreter_scope = interpreter->current_scope;
+            interpreter->current_scope = func_to_run->definition_scope;
+            enter_scope(interpreter);
+            coro->execution_scope = interpreter->current_scope;
+
+            int min_required_args = 0;
+            for (int i = 0; i < func_to_run->param_count; ++i) {
+                if (!func_to_run->params[i].default_value) min_required_args++;
+            }
+            if (arg_count < min_required_args || arg_count > func_to_run->param_count) {
+                exit_scope(interpreter);
+                interpreter->current_scope = old_interpreter_scope;
+                free(coro);
+                for (int i = 0; i < arg_count; ++i) {
+                    if (parsed_args[i].name) free(parsed_args[i].name);
+                    if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                }
+                char err_msg[250];
+                snprintf(err_msg, sizeof(err_msg), "Async function '%s' expects %d arguments (%d required), but %d were given.",
+                            func_to_run->name, func_to_run->param_count, min_required_args, arg_count);
+                report_error("Runtime", err_msg, func_name_token_for_error_reporting);
+            }
+
+            // This simplified logic for async functions does not yet support named args.
+            // A full implementation would require mapping logic similar to execute_echoc_function.
+            for (int i = 0; i < arg_count; ++i) {
+                if (i < func_to_run->param_count) {
+                    symbol_table_set(coro->execution_scope, func_to_run->params[i].name, parsed_args[i].value);
+                }
+            }
+            // Set defaults for remaining params
+            for (int i = arg_count; i < func_to_run->param_count; ++i) {
+                if (func_to_run->params[i].default_value) {
+                     symbol_table_set(coro->execution_scope, func_to_run->params[i].name, *(func_to_run->params[i].default_value));
+                }
+            }
+
+            // Now, safely clean up all parsed arguments.
+            for (int i = 0; i < arg_count; ++i) {
+                if (parsed_args[i].name) free(parsed_args[i].name);
+                if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+            }
+            interpreter->current_scope = old_interpreter_scope;
+
+            coro->name = strdup(func_to_run->name);
+            coro->state = CORO_NEW;
+            coro->result_value = create_null_value();
+            coro->exception_value = create_null_value();
+            coro->value_from_await = create_null_value();
+            coro->gather_first_exception_idx = -1;
+            coro->try_catch_stack_top = NULL;
+            coro->has_yielding_await_state = false; // Initialize new field
+            coro->yielding_await_token = NULL;
+
+            result.type = VAL_COROUTINE;
+            result.as.coroutine_val = coro;
+        } else {
+            result = execute_echoc_function(interpreter, func_to_run, NULL, parsed_args, arg_count, func_name_token_for_error_reporting);
+        }
+    } else { // Regular function call (not bound method)
+        if (!func_name_str_or_null_for_bound) {
+            report_error("Internal", "Function name missing for non-bound call.", func_name_token_for_error_reporting);
+        }
+        const char* func_name_str = func_name_str_or_null_for_bound;
+        
+        if (is_builtin_function(func_name_str)) {
+            if (strcmp(func_name_str, "show") == 0) {
+                result = builtin_show(interpreter, parsed_args, arg_count, func_name_token_for_error_reporting);
+            } else {
+                // Convert ParsedArgument to simple Value array for other built-ins and disallow named args.
+                Value simple_args[arg_count];
+                for (int i = 0; i < arg_count; ++i) {
+                    if (parsed_args[i].name) {
+                        char err_msg[250];
+                        snprintf(err_msg, sizeof(err_msg), "Built-in function '%s' does not support named arguments.", func_name_str);
+                        report_error("Runtime", err_msg, func_name_token_for_error_reporting);
+                    }
+                    simple_args[i] = parsed_args[i].value;
+                }
+                if (strcmp(func_name_str, "slice") == 0) {
+                    result = builtin_slice(interpreter, simple_args, arg_count, func_name_token_for_error_reporting);
+                } else if (strcmp(func_name_str, "type") == 0) {
+                    result = builtin_type(interpreter, simple_args, arg_count, func_name_token_for_error_reporting);
+                }
+            }
+            // Centralized cleanup for ALL built-ins.
+            // The built-in functions themselves do not free the argument values.
+            for (int i = 0; i < arg_count; ++i) {
+                if (parsed_args[i].name) free(parsed_args[i].name);
+                if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+            }
+        } else { // It must be a user-defined function.
+            Value* func_val_ptr = symbol_table_get(interpreter->current_scope, func_name_str);
+            if (func_val_ptr && func_val_ptr->type == VAL_FUNCTION) {
+                Function* func_to_run = func_val_ptr->as.function_val;
+                if (func_to_run->is_async) {
+                    // Use calloc to ensure all fields are zero-initialized (e.g. is_cancelled, pointers)
+                    Coroutine* coro = calloc(1, sizeof(Coroutine));
+                    if (!coro) {
+                        for (int i = 0; i < arg_count; ++i) {
+                            if (parsed_args[i].name) free(parsed_args[i].name);
+                            if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                        }
+                        report_error("System", "Failed to allocate Coroutine object.", func_name_token_for_error_reporting);
+                    }
+                    coro->magic_number = COROUTINE_MAGIC;
+                    coro->creation_line = func_name_token_for_error_reporting->line;
+                    coro->creation_col = func_name_token_for_error_reporting->col;
+                    coro->function_def = func_to_run;
+                    coro->ref_count = 1;
+                    coro->statement_resume_state = func_to_run->body_start_state;
+                    coro->statement_resume_state.text = func_to_run->source_text_owned_copy;
+                    coro->statement_resume_state.text_length = func_to_run->source_text_length;
+                    DEBUG_PRINTF("CORO_CREATE (EchoC): Initialized ref_count for %s (%p) to 1", func_to_run->name, (void*)coro);
+
+                    Scope* old_interpreter_scope = interpreter->current_scope;
+                    interpreter->current_scope = func_to_run->definition_scope;
+                    enter_scope(interpreter);
+                    coro->execution_scope = interpreter->current_scope;
+
+                    int min_required_args = 0;
+                    for (int i = 0; i < func_to_run->param_count; ++i) {
+                        if (!func_to_run->params[i].default_value) min_required_args++;
+                    }
+                    if (arg_count < min_required_args || arg_count > func_to_run->param_count) {
+                        exit_scope(interpreter);
+                        interpreter->current_scope = old_interpreter_scope;
+                        free(coro);
+                        for (int i = 0; i < arg_count; ++i) {
+                            if (parsed_args[i].name) free(parsed_args[i].name);
+                            if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                        }
+                        char err_msg[250];
+                        snprintf(err_msg, sizeof(err_msg), "Async function '%s' expects %d arguments (%d required), but %d were given.",
+                                    func_to_run->name, func_to_run->param_count, min_required_args, arg_count);
+                        report_error("Runtime", err_msg, func_name_token_for_error_reporting);
+                    }
+
+                    // This simplified logic for async functions does not yet support named args.
+                    // A full implementation would require mapping logic similar to execute_echoc_function.
+                    for (int i = 0; i < arg_count; ++i) {
+                        if (i < func_to_run->param_count) {
+                            symbol_table_set(coro->execution_scope, func_to_run->params[i].name, parsed_args[i].value);
+                        }
+                    }
+                    // Set defaults for remaining params
+                    for (int i = arg_count; i < func_to_run->param_count; ++i) {
+                        if (func_to_run->params[i].default_value) {
+                            symbol_table_set(coro->execution_scope, func_to_run->params[i].name, *(func_to_run->params[i].default_value));
+                        }
+                    }
+
+                    // Now, safely clean up all parsed arguments.
+                    for (int i = 0; i < arg_count; ++i) {
+                        if (parsed_args[i].name) free(parsed_args[i].name);
+                        if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                    }
+                    interpreter->current_scope = old_interpreter_scope;
+
+                    coro->name = strdup(func_to_run->name);
+                    coro->state = CORO_NEW;
+                    coro->result_value = create_null_value();
+                    coro->exception_value = create_null_value();
+                    coro->value_from_await = create_null_value();
+                    coro->gather_first_exception_idx = -1;
+                    coro->try_catch_stack_top = NULL;
+                    coro->has_yielding_await_state = false; // Initialize new field
+                    coro->yielding_await_token = NULL;
+
+                    result.type = VAL_COROUTINE;
+                    result.as.coroutine_val = coro;
+                } else {
+                    result = execute_echoc_function(interpreter, func_to_run, NULL, parsed_args, arg_count, func_name_token_for_error_reporting);
+                }
+            } else {
+                char err_msg[300];
+                for (int i = 0; i < arg_count; ++i) {
+                    if (parsed_args[i].name) free(parsed_args[i].name);
+                    if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+                }
+                snprintf(err_msg, sizeof(err_msg), "Undefined function '%s'", func_name_str);
+                report_error("Runtime", err_msg, func_name_token_for_error_reporting);
+                result = create_null_value();
+            }
+        }
+    }
+    DEBUG_PRINTF("ANY_FUNC_CALL_END: Func name '%s', Current token before return: %s ('%s')",
+                 func_name_str_or_null_for_bound ? func_name_str_or_null_for_bound : (bound_method_val_or_null ? "BOUND_METHOD" : "NULL_NAME"),
+                 token_type_to_string(interpreter->current_token->type),
+                 interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+    return result;
+}
+
+Value interpret_instance_creation(Interpreter* interpreter, Blueprint* bp_to_instantiate, Token* call_site_token) {
+    // This function is called when TOKEN_LPAREN is the current token, after the blueprint ID.
+    interpreter_eat(interpreter, TOKEN_LPAREN); // Consume '(' before parsing arguments
+    // So, we directly parse arguments here.
+
+    ParsedArgument parsed_args[10];
+    int arg_count = 0;
+    parse_call_arguments_with_named(interpreter, parsed_args, &arg_count, 10, call_site_token);
+
+
+    Object* new_obj = malloc(sizeof(Object));
+    if (!new_obj) report_error("System", "Failed to allocate memory for new object.", call_site_token);
+    new_obj->id = next_object_id++;
+    DEBUG_PRINTF("INSTANCE_CREATE: Created [Object #%llu] of blueprint '%s' at %p", new_obj->id, bp_to_instantiate->name, (void*)new_obj);
+    new_obj->ref_count = 1; // Initialize ref_count
+    new_obj->blueprint = bp_to_instantiate;
+    new_obj->instance_attributes = malloc(sizeof(Scope));
+    if (!new_obj->instance_attributes) { free(new_obj); report_error("System", "Failed to allocate instance attributes scope.", call_site_token); }
+    new_obj->instance_attributes->symbols = NULL;
+    new_obj->instance_attributes->outer = NULL; // Instance scope is isolated
+
+    Value instance_val;
+    instance_val.type = VAL_OBJECT;
+    instance_val.as.object_val = new_obj;
+
+    // Call init method if it exists
+    Function* init_method = bp_to_instantiate->init_method_cache;
+    if (!init_method) { // Try to find it if not cached (e.g. first time)
+        Value* init_val_ptr = symbol_table_get_local(bp_to_instantiate->class_attributes_and_methods, "init");
+        if (init_val_ptr && init_val_ptr->type == VAL_FUNCTION) {
+            init_method = init_val_ptr->as.function_val;
+            bp_to_instantiate->init_method_cache = init_method; // Cache it
+        }
+    }
+
+    if (init_method) {
+        if (init_method->is_async) {
+            // If init is async, it creates a coroutine. This is unusual for constructors.
+            // EchoC's 'run:' or an internal mechanism would be needed to execute this async init.
+            // For now, we'll disallow async init or treat it as an error.
+            // Free allocated object and its attributes before reporting error.
+            free_scope(new_obj->instance_attributes); // This frees the scope struct and its symbols
+            free(new_obj); // Free the object struct
+            report_error("Runtime", "'init' method cannot be 'async'.", call_site_token);
+            for (int i = 0; i < arg_count; ++i) {
+                if (parsed_args[i].name) free(parsed_args[i].name);
+                if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+            }
+        } else {
+            Value init_result = execute_echoc_function(interpreter, init_method, new_obj, parsed_args, arg_count, call_site_token);
+            if (init_result.type != VAL_NULL) {
+                 DEBUG_PRINTF("Init method for %s returned non-null (type %d). Discarding and freeing its contents.", bp_to_instantiate->name, init_result.type);
+                 free_value_contents(init_result);
+            }
+        }
+    } else {
+        // No explicit init. Check if any arguments were passed.
+        if (arg_count > 0) { // Arguments were parsed by parse_call_arguments
+            // Free allocated object and its attributes before reporting error.
+            if (new_obj->instance_attributes) {
+                free_scope(new_obj->instance_attributes); // This frees the scope struct and its symbols
+            }
+            free(new_obj); // Free the object struct
+            for (int i = 0; i < arg_count; ++i) {
+                if (parsed_args[i].name) free(parsed_args[i].name);
+                if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+            }
+            report_error("Runtime", "Blueprint has no 'init' method but arguments were provided for instantiation.", call_site_token);
+        }
+        // RPAREN was already consumed by parse_call_arguments
+    }
+    return instance_val;
+}
 
 ExprResult interpret_primary_expr(Interpreter* interpreter) {
     Token* token = interpreter->current_token;
@@ -110,7 +849,12 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
 
     if (token->type == TOKEN_LBRACE) { 
         expr_res.value = interpret_dictionary_literal(interpreter);
-        if (expr_res.value.type == VAL_DICT) expr_res.is_freshly_created_container = true;
+
+        if (interpreter->exception_is_active) {
+            expr_res.is_freshly_created_container = false; 
+        } else {
+            if (expr_res.value.type == VAL_DICT) expr_res.is_freshly_created_container = true;
+        }
         return expr_res;
     } else if (token->type == TOKEN_INTEGER) {
         val.type = VAL_INT;
@@ -125,13 +869,25 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
     } else if (token->type == TOKEN_STRING) {
         // Make a copy of the token's value for interpolation, as the original token
         // (and its value) will be freed by interpreter_eat.
-        char* string_to_interpolate = strdup(token->value);
-        if (!string_to_interpolate) report_error("System", "Failed to strdup string for interpolation.", token);
-        expr_res.value = evaluate_interpolated_string(interpreter, string_to_interpolate, token);
-        // A string from interpolation is always new.
-        if (expr_res.value.type == VAL_STRING) expr_res.is_freshly_created_container = true;
-        free(string_to_interpolate); // Free the copy after interpolation is done.
+        // Pass the token's value directly. evaluate_interpolated_string is now responsible for copying it,
+        // as the token will be consumed and its value freed after this call.
+        expr_res.value = evaluate_interpolated_string(interpreter, token->value, token);
+        
+ 
+        // Always consume the original string token from the stream.
         interpreter_eat(interpreter, TOKEN_STRING);
+ 
+        // Now, handle the result.
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            // If an error occurred, the value from evaluate_interpolated_string is a dummy VAL_NULL, so no need to free it here.
+            DEBUG_PRINTF("PRIMARY_EXPR: Exception or Yield propagated from string interpolation. Cleaning up.%s", "");
+            // The returned value is a dummy. Mark it as not fresh.
+            expr_res.is_freshly_created_container = false;
+        } else {
+            // A string from evaluation/interpolation is always a new allocation.
+            if (expr_res.value.type == VAL_STRING) expr_res.is_freshly_created_container = true;
+        }
+
         return expr_res;
     } else if (token->type == TOKEN_TRUE) {
         val.type = VAL_BOOL;
@@ -164,7 +920,11 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
             return expr_res;
         } else { 
             ExprResult first_element_res = interpret_expression(interpreter);
-
+            if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+                // If the very first item in a potential tuple yields, just propagate.
+                // No tuple has been allocated yet. The caller will handle freeing first_element_res if needed.
+                return first_element_res;
+            }
             if (interpreter->current_token->type == TOKEN_COMMA) { // Non-empty tuple
                 interpreter_eat(interpreter, TOKEN_COMMA);
                 
@@ -185,6 +945,16 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
                         if (!tuple->elements) report_error("System", "Failed to reallocate memory for tuple elements", interpreter->current_token);
                     }
                     ExprResult next_elem_res = interpret_expression(interpreter);
+                    
+                    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+                        // An element's expression yielded. We must clean up the partial tuple.
+                        if (next_elem_res.is_freshly_created_container) free_value_contents(next_elem_res.value);
+                        // Also free the first element that was stored
+                        if (first_element_res.is_freshly_created_container) free_value_contents(first_element_res.value);
+                        Value temp_tuple_val = {.type = VAL_TUPLE, .as.tuple_val = tuple};
+                        free_value_contents(temp_tuple_val); // This will free the tuple and its elements
+                        return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
+                    }
                     tuple->elements[tuple->count++] = next_elem_res.value;
                     if (interpreter->current_token->type == TOKEN_COMMA) {
                         interpreter_eat(interpreter, TOKEN_COMMA);
@@ -205,73 +975,131 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
         report_error("Internal", "Reached end of TOKEN_LPAREN block in interpret_primary_expr unexpectedly.", lparen_token_for_error_context);
     } else if (token->type == TOKEN_ID) {
         char* id_name = strdup(interpreter->current_token->value);
+        DEBUG_PRINTF("PRIMARY_EXPR_ID_START: Current token before eat: %s ('%s'), id_name: '%s'",
+                     token_type_to_string(interpreter->current_token->type),
+                     interpreter->current_token->value, id_name);
         Token* id_token_for_reporting = token_deep_copy(interpreter->current_token); // Deep copy for error reporting
         bool original_token_type_was_id = true;
         interpreter_eat(interpreter, TOKEN_ID);
 
-        if (interpreter->current_token->type == TOKEN_LPAREN) {
-            // Could be a regular function call OR a blueprint instantiation
-            Value* id_val_ptr = symbol_table_get(interpreter->current_scope, id_name);
-            if (id_val_ptr && id_val_ptr->type == VAL_BLUEPRINT) {
-                // Instance creation: Dog(arg1, arg2)
-                // interpret_instance_creation uses id_token_for_reporting for context, does not free it.
-                expr_res.value = interpret_instance_creation(interpreter, id_val_ptr->as.blueprint_val, id_token_for_reporting);
-                if (expr_res.value.type == VAL_OBJECT) expr_res.is_freshly_created_container = true;
-                expr_res.is_standalone_primary_id = false; // Instance creation is an operation
-                // id_name and id_token_for_reporting will be freed at the end of this block
-            } else {
-                // interpret_any_function_call uses id_name for lookup and id_token_for_reporting for errors.
-                // It does not free them.
+        DEBUG_PRINTF("PRIMARY_EXPR_ID_AFTER_EAT: Current token after eating '%s': %s ('%s')",
+                     id_name,
+                     token_type_to_string(interpreter->current_token->type),
+                     interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+
+        if (interpreter->current_token->type == TOKEN_LPAREN) { // It's a call expression
+            // First, check if it's a built-in function call.
+            if (is_builtin_function(id_name)) {
                 expr_res.value = interpret_any_function_call(interpreter, id_name, id_token_for_reporting, NULL);
-                // Result of a function call is considered new/temporary if it's a container type.
-                if (expr_res.value.type == VAL_OBJECT ||
-                    expr_res.value.type == VAL_ARRAY ||
-                    expr_res.value.type == VAL_DICT ||
-                    expr_res.value.type == VAL_STRING ||
-                    expr_res.value.type == VAL_TUPLE || // Added VAL_TUPLE
-                    expr_res.value.type == VAL_COROUTINE || // Coroutines are also fresh
-                    expr_res.value.type == VAL_GATHER_TASK) { // Gather tasks are fresh
-                     expr_res.is_freshly_created_container = true;
-                } else {
-                    expr_res.is_freshly_created_container = false;
+                // Mark the result as a fresh container if it is one
+                if (expr_res.value.type >= VAL_STRING && expr_res.value.type <= VAL_GATHER_TASK) {
+                    expr_res.is_freshly_created_container = true;
                 }
-                expr_res.is_standalone_primary_id = false; // Function call is an operation
-                // id_name and id_token_for_reporting will be freed at the end of this block
+            } else {
+                // If not a built-in, look it up in the symbol table.
+                Value* id_val_ptr = symbol_table_get(interpreter->current_scope, id_name);
+
+                if (id_val_ptr && id_val_ptr->type == VAL_BLUEPRINT) {
+                    // It's a blueprint instantiation.
+                    expr_res.value = interpret_instance_creation(interpreter, id_val_ptr->as.blueprint_val, id_token_for_reporting);
+                    if (expr_res.value.type == VAL_OBJECT) {
+                        expr_res.is_freshly_created_container = true;
+                    }
+                } else if (id_val_ptr && id_val_ptr->type == VAL_FUNCTION) {
+                    // It's a user-defined function call.
+                    expr_res.value = interpret_any_function_call(interpreter, id_name, id_token_for_reporting, NULL);
+                    // Mark the result as a fresh container if it is one
+                    if (expr_res.value.type >= VAL_STRING && expr_res.value.type <= VAL_GATHER_TASK) {
+                        expr_res.is_freshly_created_container = true;
+                    }
+                } else {
+                    // If it's not a built-in, not a blueprint, and not a user function, it's an error.
+                    char err_msg[300];
+                    snprintf(err_msg, sizeof(err_msg), "Identifier '%s' is not a callable function or instantiable blueprint.", id_name);
+                    free(id_name);
+                    free_token(id_token_for_reporting);
+                    report_error("Runtime", err_msg, id_token_for_reporting);
+                }
             }
         }
+
         // If not a call, it's a variable or super
         else if (strcmp(id_name, "super") == 0) { // Changed to else if
             if (!interpreter->current_self_object) {
-                // free(id_name); // Will be freed at the end
-                // free_token(id_token_for_reporting); // Will be freed at the end
+                free(id_name);
+                free_token(id_token_for_reporting);
                 report_error("Runtime", "'super' can only be used within an instance method.", id_token_for_reporting);
+            }
+            // --- Debug for 'super' path ---
+            DEBUG_PRINTF("PRIMARY_EXPR_ID_SUPER_PATH: VarName was 'super'. Scope %p. Scope symbols head: %s (NodeAddr: %p). Outer: %p",
+                         (void*)interpreter->current_scope,
+                         interpreter->current_scope->symbols ? interpreter->current_scope->symbols->name : "NULL_HEAD",
+                         (void*)interpreter->current_scope->symbols,
+                         (void*)interpreter->current_scope->outer);
+            SymbolNode* temp_sym_super = interpreter->current_scope->symbols;
+            while(temp_sym_super) { // Log all symbols in current scope if 'super' is encountered
+                DEBUG_PRINTF("    SUPER_SCOPE_SYM: '%s' (NodeAddr: %p)", temp_sym_super->name, (void*)temp_sym_super);
+                temp_sym_super = temp_sym_super->next;
             }
             val.type = VAL_SUPER_PROXY;
             // No data needed in val.as for VAL_SUPER_PROXY
             expr_res.value = val; expr_res.is_standalone_primary_id = false;
         } else {
             Value* var_val_ptr = symbol_table_get(interpreter->current_scope, id_name); // Regular variable lookup
+            // Add this debug log to check the scope's head just before the lookup
+            DEBUG_PRINTF("PRIMARY_EXPR_ID_LOOKUP: Var '%s'. Scope %p. Scope symbols head: %s. Outer: %p",
+                         id_name, (void*)interpreter->current_scope, 
+                         interpreter->current_scope->symbols ? interpreter->current_scope->symbols->name : "NULL_HEAD",
+                         (void*)interpreter->current_scope->outer);
+            // --- Add detailed symbol list dump ---
+            DEBUG_PRINTF("  Detailed symbols in scope %p (for var '%s' lookup):", (void*)interpreter->current_scope, id_name);
+            SymbolNode* temp_sym = interpreter->current_scope->symbols;
+            int sym_count = 0;
+            while(temp_sym && sym_count < 20) { // Limit to 20 to avoid huge logs
+                DEBUG_PRINTF("    -> Symbol: '%s' (Node Addr: %p, Next Addr: %p)", temp_sym->name, (void*)temp_sym, (void*)temp_sym->next);
+                temp_sym = temp_sym->next;
+                sym_count++;
+            }
+            if (temp_sym) DEBUG_PRINTF("    -> ... (more symbols)%s", "");
+            // --- End detailed symbol list dump ---
             if (var_val_ptr == NULL) {
                 char err_msg[100];
-                sprintf(err_msg, "Undefined variable '%s'", id_name);
-                // free(id_name); // Will be freed at the end
-                // free_token(id_token_for_reporting); // Will be freed at the end
-                report_error("Runtime", err_msg, id_token_for_reporting);
+                snprintf(err_msg, sizeof(err_msg), "Undefined variable '%s'", id_name);
+                free(id_name);
+                interpreter->exception_is_active = 1;
+                free_value_contents(interpreter->current_exception);
+                interpreter->current_exception.type = VAL_STRING;
+                interpreter->current_exception.as.string_val = strdup(err_msg);
+                if (interpreter->error_token) free_token(interpreter->error_token);
+                interpreter->error_token = id_token_for_reporting; // Transfer ownership of the token
+                expr_res.value = create_null_value(); // Return a dummy value
+                expr_res.is_freshly_created_container = false; // Not a fresh container
+                return expr_res; // Propagate the error flag
             }
             // For objects, arrays, dicts from variables, pass by reference (share the pointer in the Value struct).
             // Other types (primitives, strings that are copied by value_deep_copy, functions) are deep copied.
-            if (var_val_ptr->type == VAL_OBJECT || var_val_ptr->type == VAL_ARRAY || var_val_ptr->type == VAL_DICT) {
+            // When a container is retrieved by name, we want a "view" (shallow copy of the Value struct)
+            // not a deep copy, so that subsequent operations like indexing work on the original data.
+            // This prevents the original container from being freed prematurely by the postfix expression handler.
+            if (var_val_ptr->type == VAL_OBJECT || var_val_ptr->type == VAL_ARRAY || var_val_ptr->type == VAL_DICT || var_val_ptr->type == VAL_TUPLE) {
                 expr_res.value = *var_val_ptr; // Shallow copy of Value struct; shares the data pointer.
                 expr_res.is_freshly_created_container = false;
                 expr_res.is_standalone_primary_id = true; // This is a standalone ID lookup
             } else {
                 expr_res.value = value_deep_copy(*var_val_ptr);
-                // If value_deep_copy created a new container (string, array, dict, tuple, object), it's fresh.
+                // If value_deep_copy created a new container (string, array, dict, tuple, object, function, coroutine)
+                // or a new reference-counted handle (coroutine), it's considered "fresh" in terms of this Value wrapper.
                 if (expr_res.value.type == VAL_STRING || expr_res.value.type == VAL_ARRAY ||
                     expr_res.value.type == VAL_DICT || expr_res.value.type == VAL_TUPLE ||
-                    expr_res.value.type == VAL_OBJECT) {
+                    expr_res.value.type == VAL_FUNCTION || // Functions are still copied (new Function struct)
+                    expr_res.value.type == VAL_COROUTINE || expr_res.value.type == VAL_GATHER_TASK) { // Coroutines are ref-counted
                     expr_res.is_freshly_created_container = true;
-                } else { // Primitives, VAL_NULL, VAL_BLUEPRINT (ptr copy), VAL_FUNCTION (ptr copy essentially)
+                } else if (expr_res.value.type == VAL_OBJECT || expr_res.value.type == VAL_BOUND_METHOD) {
+                    // For objects and bound methods, value_deep_copy increments ref_count.
+                    // The returned Value is a "new handle" to existing data. The caller is
+                    // responsible for releasing this handle by calling free_value_contents.
+                    expr_res.is_freshly_created_container = true;
+                } else { // Primitives, VAL_NULL, VAL_BLUEPRINT (ptr copy)
                     expr_res.is_freshly_created_container = false;
                     if (original_token_type_was_id) expr_res.is_standalone_primary_id = true; // If original was ID, it's standalone
                 }
@@ -279,6 +1107,10 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
         }
         free(id_name); // Free the strdup'd name
         free_token(id_token_for_reporting); // Free the deep-copied token
+        DEBUG_PRINTF("PRIMARY_EXPR_ID_END: Current token before return: %s ('%s')",
+                     token_type_to_string(interpreter->current_token->type),
+                     interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+
         return expr_res;
     } else if (token->type == TOKEN_SUPER) { // Handle 'super' keyword as a primary expression
         if (!interpreter->current_self_object) {
@@ -289,6 +1121,7 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
         expr_res.value = val; expr_res.is_standalone_primary_id = false; return expr_res;
     } else if (token->type == TOKEN_LBRACKET) { // Array literal
         interpreter_eat(interpreter, TOKEN_LBRACKET);
+
         Array* array = malloc(sizeof(Array));
         if (!array) report_error("System", "Failed to allocate memory for array struct", token);
         array->count = 0;
@@ -307,6 +1140,18 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
                     if (!array->elements) report_error("System", "Failed to reallocate memory for array elements", interpreter->current_token);
                 }
                 ExprResult elem_res = interpret_expression(interpreter);
+
+                if (interpreter->exception_is_active) {
+                    if (elem_res.is_freshly_created_container) {
+                        free_value_contents(elem_res.value);
+                    }
+                    // Clean up partially constructed array
+                    Value temp_array_val_to_free = {.type = VAL_ARRAY, .as.array_val = array};
+                    free_value_contents(temp_array_val_to_free);
+                    ExprResult error_res = { .value = create_null_value(), .is_freshly_created_container = false, .is_standalone_primary_id = false };
+                    return error_res;
+                }
+
                 array->elements[array->count++] = elem_res.value;
                 if (interpreter->current_token->type == TOKEN_COMMA) {
                     interpreter_eat(interpreter, TOKEN_COMMA);
@@ -328,13 +1173,19 @@ ExprResult interpret_primary_expr(Interpreter* interpreter) {
 
 ExprResult interpret_postfix_expr(Interpreter* interpreter) {
     ExprResult current_expr_res = interpret_primary_expr(interpreter);
+    // If the primary expression itself yielded or had an error, propagate immediately.
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return current_expr_res;
+    }
+
     Value result = current_expr_res.value; // The actual value being operated on
     // is_freshly_created_container applies to this initial 'result'
     bool result_is_freshly_created = current_expr_res.is_freshly_created_container;
     bool is_still_standalone_id = current_expr_res.is_standalone_primary_id;
     
-    while (interpreter->current_token->type == TOKEN_LBRACKET || 
+    while (interpreter->current_token->type == TOKEN_LBRACKET ||
            interpreter->current_token->type == TOKEN_DOT ||
+           (result.type == VAL_FUNCTION && interpreter->current_token->type == TOKEN_LPAREN) || /* Function call on a resolved VAL_FUNCTION */
            (result.type == VAL_BOUND_METHOD && interpreter->current_token->type == TOKEN_LPAREN) || /* Bound method call */
            (result.type == VAL_BLUEPRINT && interpreter->current_token->type == TOKEN_LPAREN) || /* Blueprint instantiation */
            ((result.type == VAL_COROUTINE || result.type == VAL_GATHER_TASK) && interpreter->current_token->type == TOKEN_LPAREN) /* Calling a coroutine (error) or a C-builtin that returns coro */
@@ -343,18 +1194,47 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
         bool next_derived_is_fresh = false; // And its freshness
         is_still_standalone_id = false; // Any postfix operation means it's no longer a standalone ID
 
-        if (result.type == VAL_BOUND_METHOD && interpreter->current_token->type == TOKEN_LPAREN) {
-            // Handle immediate call of a bound method: e.g. obj.method()
-            Value bound_method_to_call = result; // Keep the VAL_BOUND_METHOD to free its contents
-            next_derived_value = interpret_any_function_call(interpreter, NULL, interpreter->current_token /* for error context */, &bound_method_to_call);
-            // Result of a function call is considered new/temporary if it's a container or coroutine
-            if (next_derived_value.type == VAL_OBJECT || next_derived_value.type == VAL_ARRAY || next_derived_value.type == VAL_DICT || next_derived_value.type == VAL_STRING) {
+        if (result.type == VAL_FUNCTION && interpreter->current_token->type == TOKEN_LPAREN) {
+            // Handle immediate call of a VAL_FUNCTION that was resolved (e.g., from a variable like `my_func()`)
+            Value func_val_to_call = result; // This is the temporary, fresh VAL_FUNCTION
+            
+            // FIX: Create a copy of the LPAREN token for safe error reporting.
+            Token* lparen_token_for_error = token_deep_copy(interpreter->current_token);
+
+            // Pass the resolved function value itself, not its name, to avoid re-lookup.
+            // The name argument is NULL. The last argument is a pointer to the VAL_FUNCTION,
+            // which our newly added logic in interpret_any_function_call now handles.
+            next_derived_value = interpret_any_function_call(interpreter, NULL, lparen_token_for_error, &func_val_to_call);
+            
+            // Free the copied token now that the call is complete.
+            free_token(lparen_token_for_error);
+            
+            // Set freshness for the call result
+            if (next_derived_value.type == VAL_OBJECT || next_derived_value.type == VAL_ARRAY ||
+                next_derived_value.type == VAL_DICT || next_derived_value.type == VAL_STRING ||
+                next_derived_value.type == VAL_TUPLE || next_derived_value.type == VAL_BOUND_METHOD ||
+                next_derived_value.type == VAL_COROUTINE || next_derived_value.type == VAL_GATHER_TASK) {
                 next_derived_is_fresh = true;
             } else {
                 next_derived_is_fresh = false;
             }
-            free_value_contents(bound_method_to_call); // Free the BoundMethod struct itself
-            // interpret_any_function_call will consume the LPAREN, args, and RPAREN.
+        } else if (result.type == VAL_BOUND_METHOD && interpreter->current_token->type == TOKEN_LPAREN) {
+            // Handle immediate call of a bound method: e.g. obj.method()
+            Value bound_method_to_call = result; // Keep the VAL_BOUND_METHOD to free its contents
+
+            // FIX: Create a copy of the LPAREN token for safe error reporting.
+            Token* lparen_token_for_error = token_deep_copy(interpreter->current_token);
+
+            next_derived_value = interpret_any_function_call(interpreter, NULL, lparen_token_for_error, &bound_method_to_call); // This path was already correct
+
+            // Free the copied token.
+            free_token(lparen_token_for_error);
+            // Result of a function call is considered new/temporary if it's a container or coroutine
+            if (next_derived_value.type >= VAL_STRING && next_derived_value.type <= VAL_GATHER_TASK && next_derived_value.type != VAL_BLUEPRINT && next_derived_value.type != VAL_SUPER_PROXY) { // More general check for containers/complex types
+                next_derived_is_fresh = true;
+            } else {
+                next_derived_is_fresh = false;
+            }
         } else if (result.type == VAL_BLUEPRINT && interpreter->current_token->type == TOKEN_LPAREN) {
             // Handle blueprint instantiation: e.g. some_expression_resulting_in_blueprint(...)
             Value blueprint_to_instantiate_val = result; // This is the VAL_BLUEPRINT
@@ -373,86 +1253,156 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
         } else if ((result.type == VAL_COROUTINE || result.type == VAL_GATHER_TASK) && interpreter->current_token->type == TOKEN_LPAREN) {
             // This means something like `my_coro_obj()` which is not allowed after creation.
             if (result_is_freshly_created) { // Free the coroutine object if it was temporary
-                free_value_contents(result); // Free the VAL_BLUEPRINT's contents
+                free_value_contents(result); // Free the coroutine's contents
             }
+            // Report error and set exception flag
+            interpreter->exception_is_active = 1;
+            free_value_contents(interpreter->current_exception);
+            interpreter->current_exception.type = VAL_STRING;
+            interpreter->current_exception.as.string_val = strdup("Cannot call a coroutine object directly. Use 'await' or 'weaver.spawn_task'.");
+            if (interpreter->error_token) free_token(interpreter->error_token);
+            interpreter->error_token = token_deep_copy(interpreter->current_token); // Use current token (LPAREN) for error context
+            // The loop will break and propagate this error.
+            next_derived_value = create_null_value(); // Dummy value
+            next_derived_is_fresh = false;
+            break; // Exit the while loop to propagate the error
         } else if (interpreter->current_token->type == TOKEN_LBRACKET) {
-            Token* bracket_token = interpreter->current_token;
+
+            Token* bracket_token = token_deep_copy(interpreter->current_token);
             interpreter_eat(interpreter, TOKEN_LBRACKET);
             ExprResult index_expr_res = interpret_expression(interpreter);
             Value index_val = index_expr_res.value;
+            bool index_is_fresh = index_expr_res.is_freshly_created_container;
             
+            if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) { // Exception or YIELD during index expression parsing
+                if(result_is_freshly_created) free_value_contents(result); // Free base if it was fresh
+                if(index_expr_res.is_freshly_created_container) free_value_contents(index_val);
+                free_token(bracket_token);
+                // For yield or exception, return a dummy value and let the caller see the interpreter state.
+                return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false, .is_standalone_primary_id = false };
+            }
+
+            char* base_str_for_debug = value_to_string_representation(result, interpreter, bracket_token);
+            char* index_str_for_debug = value_to_string_representation(index_val, interpreter, bracket_token);
+            free(base_str_for_debug);
+            free(index_str_for_debug);
+
             if (result.type == VAL_ARRAY) {
                 if (index_val.type != VAL_INT) {
-                    free_value_contents(result); free_value_contents(index_val);
+                    if(result_is_freshly_created) free_value_contents(result); // Free the base
+                    if(index_is_fresh) free_value_contents(index_val); // Free the index
                     report_error("Runtime", "Array index must be an integer.", bracket_token);
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup("Array index must be an integer.");
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
                 }
+
                 Array* arr_ptr = result.as.array_val; 
                 long idx = index_val.as.integer; 
                 long effective_idx = idx;
                 if (effective_idx < 0) effective_idx += arr_ptr->count;
 
                 if (effective_idx < 0 || effective_idx >= arr_ptr->count) {
-                    free_value_contents(result); free_value_contents(index_val);
-                    report_error("Runtime", "Array index out of bounds.", bracket_token);
+                    if(result_is_freshly_created) free_value_contents(result);
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup("Array index out of bounds.");
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
                 }
-                Value element = value_deep_copy(arr_ptr->elements[effective_idx]);
-                next_derived_value = element;
-                next_derived_is_fresh = true; // Deep copy is fresh
-                // index_val (if int) has no complex contents to free via free_value_contents.
+                // Return a view (shallow copy of Value struct), not a deep copy.
+                // The caller (e.g., assignment) is responsible for deep copying if needed.
+                next_derived_value = arr_ptr->elements[effective_idx];
+                next_derived_is_fresh = false;
             } else if (result.type == VAL_DICT) {
                 if (index_val.type != VAL_STRING) {
-                    // result is handled by result_is_freshly_created check later.
-                    free_value_contents(index_val); // Free index_val if it's not a string.
-                    report_error("Runtime", "Dictionary key must be a string.", bracket_token);
-                }                
+                    if(result_is_freshly_created) free_value_contents(result);
+                    if(index_is_fresh) free_value_contents(index_val);
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup("Dictionary key must be a string.");
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
+                }
                 Value element;
-                // If the dictionary itself is a temporary/freshly created one, we must deep copy its elements
-                // to avoid dangling pointers when the temporary dictionary is freed.
-                // Otherwise, we can get a "view" (shallow copy of Value struct) into the persistent dictionary.
-                if (!dictionary_try_get(result.as.dict_val, index_val.as.string_val, &element, result_is_freshly_created /*DEEP_COPY_CONTENTS if dict is fresh*/)) {
-                     char err_msg[150];
-                     sprintf(err_msg, "Key '%s' not found in dictionary.", index_val.as.string_val);
-                     if(result_is_freshly_created) free_value_contents(result);
-                     free_value_contents(index_val); // index_val is VAL_STRING here
-                     report_error("Runtime", err_msg, bracket_token);
+
+                // Get a view (shallow copy of Value struct) of the element.
+                // The caller (e.g., assignment) is responsible for deep copying if needed.
+                if (!dictionary_try_get(result.as.dict_val, index_val.as.string_val, &element, false)) {
+                    char err_msg[150];
+                    snprintf(err_msg, sizeof(err_msg), "Key '%s' not found in dictionary.", index_val.as.string_val);
+                    if(result_is_freshly_created) free_value_contents(result); // Free the base
+                    if (index_is_fresh) free_value_contents(index_val); // Free the index
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup(err_msg);
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
                 }
-                free_value_contents(index_val); // index_val (string key) was used by dictionary_try_get.
-                next_derived_value = element; // element is a deep copy.
-                // If the dictionary was fresh, 'element' is a deep copy and thus fresh.
-                // If the dictionary was not fresh, 'element' is a view, so it's not fresh.
-                // Exception: if dictionary_try_get with false still deep_copies strings (it shouldn't for VAL_STRING from dict).
-                // value_deep_copy always makes fresh strings/arrays/dicts/tuples/objects.
-                // A view (shallow copy of Value struct) is not "freshly_created_container".
-                if (result_is_freshly_created && (element.type == VAL_STRING || element.type == VAL_ARRAY || element.type == VAL_DICT || element.type == VAL_TUPLE || element.type == VAL_OBJECT)) {
-                    next_derived_is_fresh = true;
-                } else {
-                    next_derived_is_fresh = false;
-                }
+                next_derived_value = element; // 'element' is a shallow copy of the Value struct.
+                next_derived_is_fresh = false; // It's a view, not a fresh container.
             } else if (result.type == VAL_STRING) {
                 if (index_val.type != VAL_INT) {
-                    free_value_contents(result); free_value_contents(index_val);
-                    report_error("Runtime", "String index must be an integer.", bracket_token);
+                    if(result_is_freshly_created) free_value_contents(result);
+                    if(index_is_fresh) free_value_contents(index_val);
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup("String index must be an integer.");
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
                 }
                 long idx = index_val.as.integer;
                 size_t str_len = strlen(result.as.string_val);
                 if (idx < 0) idx = (long)str_len + idx;
                 if (idx < 0 || (size_t)idx >= str_len) { // Cast idx to size_t for comparison
-                    // result is handled by result_is_freshly_created check later.
-                    // index_val (if int) has no complex contents.
-                    report_error("Runtime", "String index out of bounds.", bracket_token);
+                    if(result_is_freshly_created) free_value_contents(result); // Free the base
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup("String index out of bounds.");
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
                 }
                 char* charStr = malloc(2);
                 if (!charStr) report_error("System", "Memory allocation failed during string indexing.", bracket_token);
                 charStr[0] = result.as.string_val[idx];
                 charStr[1] = '\0';
                 // index_val (if int) has no complex contents.
-                next_derived_value.type = VAL_STRING;
+                next_derived_value.type = VAL_STRING; // This is a new string
                 next_derived_value.as.string_val = charStr;
                 next_derived_is_fresh = true; // New string
             } else if (result.type == VAL_TUPLE) {
                 if (index_val.type != VAL_INT) {
-                    free_value_contents(result); free_value_contents(index_val);
-                    report_error("Runtime", "Tuple index must be an integer.", bracket_token);
+                    if(result_is_freshly_created) free_value_contents(result);
+                    if(index_is_fresh) free_value_contents(index_val);
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup("Tuple index must be an integer.");
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
                 }
                 Tuple* tuple_ptr = result.as.tuple_val;
                 long idx = index_val.as.integer;
@@ -460,28 +1410,39 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                 if (effective_idx < 0) effective_idx += tuple_ptr->count;
 
                 if (effective_idx < 0 || effective_idx >= tuple_ptr->count) {
-                    free_value_contents(result); free_value_contents(index_val);
-                    report_error("Runtime", "Tuple index out of bounds.", bracket_token);
+                    if(result_is_freshly_created) free_value_contents(result);
+                    interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                    free_value_contents(interpreter->current_exception);
+                    interpreter->current_exception.type = VAL_STRING;
+                    interpreter->current_exception.as.string_val = strdup("Tuple index out of bounds.");
+                    if (interpreter->error_token) free_token(interpreter->error_token);
+                    interpreter->error_token = token_deep_copy(bracket_token);
+                    free_token(bracket_token);
+                    return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
                 }
-                Value element = value_deep_copy(tuple_ptr->elements[effective_idx]);
-                next_derived_value = element;
-                next_derived_is_fresh = true; // Deep copy is fresh
-                // index_val (if int) has no complex contents.
+                // Return a view (shallow copy of Value struct), not a deep copy.
+                // The caller (e.g., assignment) is responsible for deep copying if needed.
+                next_derived_value = tuple_ptr->elements[effective_idx];
+                next_derived_is_fresh = false;
             } else {
-                free_value_contents(result); free_value_contents(index_val);
-                report_error("Runtime", "Can only index into arrays, strings, dictionaries, or tuples.", bracket_token);
+                if(result_is_freshly_created) free_value_contents(result);
+                if(index_is_fresh) free_value_contents(index_val);
+                interpreter->exception_is_active = 1; // This part is likely unreachable due to report_error exiting
+                free_value_contents(interpreter->current_exception);
+                interpreter->current_exception.type = VAL_STRING;
+                interpreter->current_exception.as.string_val = strdup("Can only index into arrays, strings, dictionaries, or tuples.");
+                if (interpreter->error_token) free_token(interpreter->error_token);
+                interpreter->error_token = token_deep_copy(bracket_token);
+                free_token(bracket_token);
+                return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
             }
             interpreter_eat(interpreter, TOKEN_RBRACKET);
 
-            // Manage freeing of the old 'result' (which is 'result' before this assignment)
-            bool should_free_old_result_contents = result_is_freshly_created;
+            // Free the index value now that it has been used for this operation.
+            if (index_is_fresh) free_value_contents(index_val);
 
-            // For VAL_DICT indexing, next_derived_value is now always a deep copy,
-            // so no special ownership transfer of the dictionary's contents to a view is needed.
-            // The original 'result' (dictionary) can be freed if it was fresh.
-            // For VAL_ARRAY, VAL_TUPLE, VAL_STRING indexing, next_derived_value is also always a new copy.
-            // So if result_is_freshly_created, old 'result' should be freed. This is covered by the initial assignment.
-            if (should_free_old_result_contents) free_value_contents(result);
+            free_token(bracket_token);
+
         } else if (interpreter->current_token->type == TOKEN_DOT) {
             Token* dot_token = token_deep_copy(interpreter->current_token); // Deep copy for error reporting
             interpreter_eat(interpreter, TOKEN_DOT);
@@ -562,7 +1523,7 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
 
                     if (!attr_val_ptr) {
                         char err_msg[150];
-                        sprintf(err_msg, "Object of blueprint '%s' has no attribute or method '%s'.", obj->blueprint->name, attr_name);
+                        snprintf(err_msg, sizeof(err_msg), "Object of blueprint '%s' has no attribute or method '%s'.", obj->blueprint->name, attr_name);
                         free(attr_name); if(result_is_freshly_created) free_value_contents(result);
                         report_error("Runtime", err_msg, dot_token);
                         free_token(dot_token);
@@ -576,6 +1537,7 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                             if(result_is_freshly_created) free_value_contents(result);
                             report_error("System", "Failed to allocate memory for bound method for object attribute.", dot_token);
                         }
+                        bm->ref_count = 1; // Initialize ref count
                         bm->type = FUNC_TYPE_ECHOC;
                         bm->func_ptr.echoc_function = attr_val_ptr->as.function_val;
                         bm->self_value.type = VAL_OBJECT; // Assign type
@@ -597,7 +1559,8 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                             // Mark as fresh if it's a container type that value_deep_copy creates anew
                             if (next_derived_value.type == VAL_STRING || next_derived_value.type == VAL_ARRAY ||
                                 next_derived_value.type == VAL_DICT || next_derived_value.type == VAL_TUPLE ||
-                                next_derived_value.type == VAL_OBJECT) {
+                                next_derived_value.type == VAL_OBJECT || next_derived_value.type == VAL_FUNCTION ||
+                                next_derived_value.type == VAL_COROUTINE || next_derived_value.type == VAL_GATHER_TASK) {
                                 next_derived_is_fresh = true;
                             } else {
                                 next_derived_is_fresh = false;
@@ -631,7 +1594,7 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
 
                     if (!class_attr_ptr) {
                         char err_msg[150];
-                        sprintf(err_msg, "Blueprint '%s' (and its parents) has no class attribute or static method '%s'.", bp->name, attr_name);
+                        snprintf(err_msg, sizeof(err_msg), "Blueprint '%s' (and its parents) has no class attribute or static method '%s'.", bp->name, attr_name);
                         free(attr_name); if(result_is_freshly_created) free_value_contents(result);
                         report_error("Runtime", err_msg, dot_token);
                         free_token(dot_token);
@@ -640,7 +1603,8 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                     // Mark as fresh if it's a container type that value_deep_copy creates anew
                     if (next_derived_value.type == VAL_STRING || next_derived_value.type == VAL_ARRAY ||
                         next_derived_value.type == VAL_DICT || next_derived_value.type == VAL_TUPLE ||
-                        next_derived_value.type == VAL_OBJECT) {
+                        next_derived_value.type == VAL_OBJECT || next_derived_value.type == VAL_FUNCTION ||
+                        next_derived_value.type == VAL_COROUTINE || next_derived_value.type == VAL_GATHER_TASK) {
                         next_derived_is_fresh = true;
                     } else {
                         next_derived_is_fresh = false;
@@ -654,17 +1618,18 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                         if(result_is_freshly_created) free_value_contents(result);
                         report_error("System", "Failed to allocate memory for array.append bound method.", dot_token);
                     }
+                    bm->ref_count = 1; // Initialize ref count
                     bm->type = FUNC_TYPE_C_BUILTIN;
                     bm->func_ptr.c_builtin = builtin_append;
                     bm->self_value = result; // The array itself. If result was fresh, bm takes ownership.
-                    bm->self_is_owned_copy = result_is_freshly_created; 
+                    bm->self_is_owned_copy = result_is_freshly_created;
 
                     next_derived_value.type = VAL_BOUND_METHOD;
                     next_derived_value.as.bound_method_val = bm;
                     next_derived_is_fresh = true; // The BoundMethod struct is new.
                 } else {
                     char err_msg[150];
-                    sprintf(err_msg, "Array has no attribute or method '%s'.", attr_name);
+                    snprintf(err_msg, sizeof(err_msg), "Array has no attribute or method '%s'.", attr_name);
                     free(attr_name); if(result_is_freshly_created) free_value_contents(result);
                     report_error("Runtime", err_msg, dot_token);
                     free_token(dot_token);
@@ -672,16 +1637,16 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
             } else if (result.type == VAL_DICT) { // Handle dict.key access
                 Dictionary* dict = result.as.dict_val;
                 Value val_from_dict;
-                if (dictionary_try_get(dict, attr_name, &val_from_dict, result_is_freshly_created /*DEEP_COPY_CONTENTS if dict is fresh*/)) {
-                    next_derived_value = val_from_dict; 
-                    next_derived_is_fresh = result_is_freshly_created && (val_from_dict.type == VAL_STRING || val_from_dict.type == VAL_ARRAY || val_from_dict.type == VAL_DICT || val_from_dict.type == VAL_TUPLE || val_from_dict.type == VAL_OBJECT);
+                // Get a view (shallow copy) to be consistent with dict["key"] access.
+                if (dictionary_try_get(dict, attr_name, &val_from_dict, false)) {
+                    next_derived_value = val_from_dict; // val_from_dict is a view.
+                    next_derived_is_fresh = false;      // A view is not a fresh container.
                 } else { // Key not found
                     char err_msg[150];
-                    sprintf(err_msg, "Key '%s' not found in dictionary.", attr_name);
+                    snprintf(err_msg, sizeof(err_msg), "Key '%s' not found in dictionary.", attr_name);
                     free(attr_name); if(result_is_freshly_created) free_value_contents(result);
                     report_error("Runtime", err_msg, dot_token);
                     free_token(dot_token); // Free if report_error didn't exit
-                    next_derived_is_fresh = true; // Deep copy is fresh
                 }
             } else if (result.type == VAL_SUPER_PROXY) { // super.method_name
                 Object* self_obj_for_super = interpreter->current_self_object;
@@ -694,9 +1659,9 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                 if (!parent_member_ptr || parent_member_ptr->type != VAL_FUNCTION) {
                     char err_msg[150];
                     if (!parent_member_ptr)
-                        sprintf(err_msg, "Parent blueprint of '%s' does not have attribute or method '%s'.", self_obj_for_super->blueprint->name, attr_name);
+                        snprintf(err_msg, sizeof(err_msg), "Parent blueprint of '%s' does not have attribute or method '%s'.", self_obj_for_super->blueprint->name, attr_name);
                     else
-                        sprintf(err_msg, "Attribute '%s' in parent blueprint of '%s' is not a method.", attr_name, self_obj_for_super->blueprint->name);
+                        snprintf(err_msg, sizeof(err_msg), "Attribute '%s' in parent blueprint of '%s' is not a method.", attr_name, self_obj_for_super->blueprint->name);
 
                     free(attr_name); if(result_is_freshly_created) free_value_contents(result);
                     report_error("Runtime", err_msg, dot_token);
@@ -704,6 +1669,7 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                 }
                 BoundMethod* bm = malloc(sizeof(BoundMethod));
                 if (!bm) { /* error */ }
+                bm->ref_count = 1; // Initialize ref count
                 bm->type = FUNC_TYPE_ECHOC;
                 bm->func_ptr.echoc_function = parent_member_ptr->as.function_val;
                 bm->self_value.type = VAL_OBJECT; // Assign type
@@ -714,7 +1680,7 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
                 next_derived_is_fresh = true; // BoundMethod struct is new
             } else {
                 char err_msg[100];
-                sprintf(err_msg, "Cannot access attribute '%s' on non-object/blueprint/super_proxy type (got type %d).", attr_name, result.type);
+                snprintf(err_msg, sizeof(err_msg), "Cannot access attribute '%s' on non-object/blueprint/super_proxy type (got type %d).", attr_name, result.type);
                 free(attr_name); if(result_is_freshly_created) free_value_contents(result);
                 report_error("Runtime", err_msg, dot_token);
                 free_token(dot_token);
@@ -723,34 +1689,37 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
             free(attr_name);
             free_token(dot_token); // Free the copied dot_token after successful processing or if error didn't exit
 
-            // Manage freeing of the old 'result' (which is 'result' before this assignment)
-            // before updating it to 'derived_value_after_dot'.
-            bool should_free_old_result_contents = result_is_freshly_created;
+            // If we created a new BoundMethod but there's an error later, ensure it gets freed
+            if (next_derived_is_fresh && interpreter->exception_is_active) {
+                free_value_contents(next_derived_value);
+                next_derived_value = create_null_value();
+            }
+        }
+        // --- START: Consolidated Memory Management for 'result' ---
+        if (result_is_freshly_created) {
+            bool should_free_old_result = true;
 
+            // DON'T free old 'result' if the new 'next_derived_value' is a bound method
+            // that has taken ownership of the old value (e.g., array.append).
             if (next_derived_value.type == VAL_BOUND_METHOD) {
                 BoundMethod* bm = next_derived_value.as.bound_method_val;
-                // If the bound method's self_value IS the old result (by pointer equality for complex types),
-                // and the BM is marked as owning it (bm->self_is_owned_copy is true, which means result_is_freshly_created was true),
-                // then the BM is now responsible for freeing it. Don't free old_result_contents here.
-                if (bm->self_is_owned_copy) { 
-                    if (result.type == VAL_OBJECT && bm->self_value.type == VAL_OBJECT && bm->self_value.as.object_val == result.as.object_val) {
-                        should_free_old_result_contents = false;
-                    } else if (result.type == VAL_ARRAY && bm->self_value.type == VAL_ARRAY && bm->self_value.as.array_val == result.as.array_val) {
-                        should_free_old_result_contents = false;
+                if (bm->self_is_owned_copy) {
+                    // Check if the bound method's 'self' is indeed the old result.
+                    if (bm->self_value.type == result.type) {
+                        if ((result.type == VAL_OBJECT && result.as.object_val == bm->self_value.as.object_val) ||
+                            (result.type == VAL_ARRAY && result.as.array_val == bm->self_value.as.array_val)) {
+                            should_free_old_result = false;
+                        }
                     }
-                    // Add other types if they can be 'self' and are pointer-based and incorporated this way
                 }
-            } else if (result.type == VAL_OBJECT && next_derived_value.type == VAL_BLUEPRINT && result.as.object_val && next_derived_value.as.blueprint_val == result.as.object_val->blueprint) {
-                // Accessing obj.blueprint. `result` contains the object. Don't free the object's contents.
-                should_free_old_result_contents = false;
-            } else {
-                // Only free the 'result' container if it was freshly created in this postfix chain.
-                // This 'else' branch is now covered by should_free_old_result_contents default state.
             }
-            if (should_free_old_result_contents) {
+
+            if (should_free_old_result) {
                 free_value_contents(result);
             }
         }
+        // --- END: Consolidated Memory Management ---
+
         // Update result for the next iteration of the postfix loop
         result = next_derived_value;
         result_is_freshly_created = next_derived_is_fresh;
@@ -764,21 +1733,36 @@ ExprResult interpret_postfix_expr(Interpreter* interpreter) {
 
 ExprResult interpret_power_expr(Interpreter* interpreter) {
     ExprResult left_res = interpret_postfix_expr(interpreter);
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
     Value left = left_res.value;
 
     if (interpreter->current_token->type == TOKEN_POWER) {
-        Token* op_token = interpreter->current_token; // Save for error reporting
+        // --- FIX: Deep copy the operator token before it's eaten ---
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
+
         interpreter_eat(interpreter, TOKEN_POWER);
         ExprResult right_res = interpret_power_expr(interpreter); // Right-associative
+
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            if (left_res.is_freshly_created_container) free_value_contents(left_res.value);
+            if (right_res.is_freshly_created_container) free_value_contents(right_res.value);
+            free_token(op_token_copy);
+            return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
+        }
+
         Value right = right_res.value;
 
         if (!((left.type == VAL_INT || left.type == VAL_FLOAT) &&
               (right.type == VAL_INT || right.type == VAL_FLOAT))) {
-            if (left_res.is_freshly_created_container) free_value_contents(left);
-            if (right_res.is_freshly_created_container) free_value_contents(right);
-            report_error("Runtime", "Operands for power operation ('^') must be numbers.", op_token);
+            if (left_res.is_freshly_created_container) free_value_contents(left_res.value); // Use left_res.value
+            if (right_res.is_freshly_created_container) free_value_contents(right_res.value); // Use right_res.value
+            // --- FIX: This call is now safe because op_token_copy is a valid copy ---
+            report_error("Runtime", "Operands for power operation ('^') must be numbers.", op_token_copy);
+            free_token(op_token_copy); // Free the copy before returning/exiting due to error (report_error exits)
+            // report_error exits, so this is more for logical completeness if it didn't.
         }
-
         double left_val = (left.type == VAL_INT) ? left.as.integer : left.as.floating;
         double right_val = (right.type == VAL_INT) ? right.as.integer : right.as.floating;
         
@@ -794,65 +1778,104 @@ ExprResult interpret_power_expr(Interpreter* interpreter) {
         final_res.value = result_val;
         final_res.is_freshly_created_container = false; // Numbers are not containers in this context
         final_res.is_standalone_primary_id = false; // Result of an operation
+
+        // --- FIX: Free the copied token ---
+        free_token(op_token_copy);
         return final_res;
     }
     return left_res; // No power op, return original ExprResult
 }
 
 ExprResult interpret_unary_expr(Interpreter* interpreter) {
-    ExprResult final_res;
     if (interpreter->current_token->type == TOKEN_NOT) {
-        Token* op_token = interpreter->current_token;
+        // --- FIX: Deep copy the operator token before it's eaten ---
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
+
         interpreter_eat(interpreter, TOKEN_NOT);
         ExprResult operand_res = interpret_unary_expr(interpreter);
         Value operand = operand_res.value;
-
-        if (operand.type != VAL_BOOL) {
-            free_value_contents(operand);
-            report_error("Runtime", "Operand for 'not' must be a boolean.", op_token);
-        }
+        
+        // The result of 'not' is always a boolean.
+        ExprResult final_res;
         Value result;
         result.type = VAL_BOOL;
-        result.as.bool_val = !operand.as.bool_val;
-        // free_value_contents(operand) not needed as it's VAL_BOOL
+        result.as.bool_val = !value_is_truthy(operand); // Negate the truthiness
+
+        // We need to free the operand if it was a temporary container.
+        if (operand_res.is_freshly_created_container) {
+            free_value_contents(operand);
+        }
+
         final_res.value = result;
         final_res.is_freshly_created_container = false;
         final_res.is_standalone_primary_id = false; // Result of 'not'
+
+        // --- FIX: Free the copied token ---
+        free_token(op_token_copy);
         return final_res;
     } else if (interpreter->current_token->type == TOKEN_MINUS) {
-        Token* op_token = interpreter->current_token;
+        // --- FIX: Deep copy the operator token before it's eaten ---
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
+
         interpreter_eat(interpreter, TOKEN_MINUS);
         ExprResult operand_res = interpret_unary_expr(interpreter);
         Value operand = operand_res.value; // operand_res.is_freshly_created_container is not directly used here
-                                         // as we modify operand in place or error.
+
+                                          // as we modify operand in place or error.
+        ExprResult final_res;
         if (operand.type == VAL_INT) {
             operand.as.integer = -operand.as.integer;
         } else if (operand.type == VAL_FLOAT) {
             operand.as.floating = -operand.as.floating;
         } else {
-            free_value_contents(operand);
-            report_error("Runtime", "Operand for unary minus must be a number.", op_token);
+            if(operand_res.is_freshly_created_container) free_value_contents(operand); // Free if it was fresh
+	        // --- FIX: This call is now safe because op_token_copy is a valid copy ---
+            report_error("Runtime", "Operand for unary minus must be a number.", op_token_copy); // Use op_token_copy from TOKEN_MINUS block scope
+            free_token(op_token_copy); // Free before returning due to error (report_error exits)
         }
+
         final_res.value = operand; // operand is modified in place
         final_res.is_freshly_created_container = operand_res.is_freshly_created_container; // Propagate if it was already fresh
         final_res.is_standalone_primary_id = false; // Result of unary minus
+        // --- FIX: Free the copied token ---
+        free_token(op_token_copy);
         return final_res;
     }
-    return interpret_power_expr(interpreter);
+    ExprResult res = interpret_power_expr(interpreter);
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return res;
+    }
+    return res;
 }
 
 ExprResult interpret_multiplicative_expr(Interpreter* interpreter) {
     ExprResult left_res = interpret_unary_expr(interpreter);
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
     Value left = left_res.value;
     bool current_res_is_fresh = left_res.is_freshly_created_container;
     bool is_standalone = left_res.is_standalone_primary_id;
 
     while (interpreter->current_token->type == TOKEN_MUL || interpreter->current_token->type == TOKEN_DIV ||
            interpreter->current_token->type == TOKEN_MOD) {
+
         TokenType op_type = interpreter->current_token->type;
-        Token* op_token = interpreter->current_token;
+
+        // --- FIX: Deep copy the operator token before it's eaten ---
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
+
         interpreter_eat(interpreter, op_type);
         ExprResult right_res = interpret_unary_expr(interpreter);
+
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            if (current_res_is_fresh) free_value_contents(left); // Free the left-side value if it was a temporary.
+            if (right_res.is_freshly_created_container) free_value_contents(right_res.value);
+            free_token(op_token_copy);
+            // Propagate the error/yield result.
+            return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
+        }
+
         Value right = right_res.value;
         bool right_is_fresh = right_res.is_freshly_created_container;
         
@@ -873,11 +1896,12 @@ ExprResult interpret_multiplicative_expr(Interpreter* interpreter) {
                 if (times < 0) {
                     if(current_res_is_fresh) free_value_contents(left);
                     // right is VAL_INT, no complex contents to free.
-                    report_error("Runtime", "Cannot repeat string a negative number of times.", op_token);
+                    report_error("Runtime", "Cannot repeat string a negative number of times.", op_token_copy);
+                    free_token(op_token_copy); // Free before returning due to error (report_error exits)
                 }
                 size_t old_len = strlen(left.as.string_val);
                 char* new_str = malloc(old_len * times + 1);
-                if (!new_str) report_error("System", "Memory allocation failed for string repetition", op_token);
+                if (!new_str) report_error("System", "Memory allocation failed for string repetition", op_token_copy);
                 new_str[0] = '\0';
                 for (long i = 0; i < times; i++) strcat(new_str, left.as.string_val);
                 result_val.type = VAL_STRING;
@@ -888,11 +1912,12 @@ ExprResult interpret_multiplicative_expr(Interpreter* interpreter) {
                 if (times < 0) {
                     // left is VAL_INT, no complex contents.
                     if(right_is_fresh) free_value_contents(right);
-                    report_error("Runtime", "Cannot repeat string a negative number of times.", op_token);
+                    report_error("Runtime", "Cannot repeat string a negative number of times.", op_token_copy);
+                    free_token(op_token_copy); // Free before returning due to error (report_error exits)
                 }
                 size_t str_len = strlen(right.as.string_val);
                 char* new_str = malloc(str_len * times + 1);
-                if (!new_str) report_error("System", "Memory allocation failed for string repetition", op_token);
+                if (!new_str) report_error("System", "Memory allocation failed for string repetition", op_token_copy);
                 new_str[0] = '\0';
                 for (long i = 0; i < times; i++) strcat(new_str, right.as.string_val);
                 result_val.type = VAL_STRING;
@@ -901,33 +1926,41 @@ ExprResult interpret_multiplicative_expr(Interpreter* interpreter) {
             } else {
                 if(current_res_is_fresh) free_value_contents(left);
                 if(right_is_fresh) free_value_contents(right);
-                report_error("Runtime", "Unsupported operand types for '*' operator.", op_token);
+                report_error("Runtime", "Unsupported operand types for '*' operator.", op_token_copy);
+                free_token(op_token_copy); // Free before returning due to error (report_error exits)
             }
-        } else if (op_type == TOKEN_MOD) { // New modulo logic
-            // Only support modulo for integers.
+        } else if (op_type == TOKEN_MOD) {
+            // Modulo logic should be strict: only integers are supported.
             if (left.type != VAL_INT || right.type != VAL_INT) {
-                if(current_res_is_fresh) free_value_contents(left); else if (left.type != VAL_INT && left.type != VAL_FLOAT) free_value_contents(left);
-                if(right_is_fresh) free_value_contents(right); else if (right.type != VAL_INT && right.type != VAL_FLOAT) free_value_contents(right);
-                report_error("Runtime", "Operands for modulo ('%') must be integers.", op_token);
+                if (current_res_is_fresh) free_value_contents(left);
+                if (right_is_fresh) free_value_contents(right);
+                report_error("Runtime", "Operands for modulo ('%') must be integers.", op_token_copy);
+                // report_error exits, so no need to return a value.
             }
+
             if (right.as.integer == 0) {
-                // Operands are VAL_INT, no complex contents to free.
-                report_error("Runtime", "Division by zero in modulo operation.", op_token);
+                // No need to free left/right here as they are integers and have no allocated content.
+                report_error("Runtime", "Division by zero in modulo operation.", op_token_copy);
             }
+
             result_val.type = VAL_INT;
             result_val.as.integer = left.as.integer % right.as.integer;
-            new_op_res_is_fresh = false; // Numeric result
+            new_op_res_is_fresh = false; // Numeric result is not a "fresh container".
         } else { // TOKEN_DIV
             if (!((left.type == VAL_INT || left.type == VAL_FLOAT) && (right.type == VAL_INT || right.type == VAL_FLOAT))) {
-                if(current_res_is_fresh) free_value_contents(left); else if (left.type != VAL_INT && left.type != VAL_FLOAT) free_value_contents(left);
-                if(right_is_fresh) free_value_contents(right); else if (right.type != VAL_INT && right.type != VAL_FLOAT) free_value_contents(right);
-                report_error("Runtime", "Operands for '/' must both be numbers.", op_token);
+                if(current_res_is_fresh) free_value_contents(left);
+                else if (left.type != VAL_INT && left.type != VAL_FLOAT && left.type != VAL_NULL) free_value_contents(left); // Added VAL_NULL check
+                if(right_is_fresh) free_value_contents(right);
+                else if (right.type != VAL_INT && right.type != VAL_FLOAT && right.type != VAL_NULL) free_value_contents(right); // Added VAL_NULL check
+                report_error("Runtime", "Operands for '/' must both be numbers.", op_token_copy);
+                free_token(op_token_copy); // Free before returning due to error (report_error exits)
             }
             double left_val = (left.type == VAL_INT) ? left.as.integer : left.as.floating;
             double right_val = (right.type == VAL_INT) ? right.as.integer : right.as.floating;
             if (right_val == 0) {
                 // Operands are numbers, no complex contents to free.
-                report_error("Runtime", "Division by zero", op_token);
+                report_error("Runtime", "Division by zero", op_token_copy);
+                free_token(op_token_copy); // Free before returning due to error (report_error exits)
             }
             result_val.type = VAL_FLOAT;
             result_val.as.floating = left_val / right_val;
@@ -940,6 +1973,19 @@ ExprResult interpret_multiplicative_expr(Interpreter* interpreter) {
 
         left = result_val;
         current_res_is_fresh = new_op_res_is_fresh;
+
+        // --- FIX: Free the copied token at the end of the loop iteration ---
+        free_token(op_token_copy);
+    }
+
+    // After the loop, if an exception is active (e.g., from the TOKEN_MOD block)
+    if (interpreter->exception_is_active) {
+        if (current_res_is_fresh) free_value_contents(left); // Free the dummy 'left'
+        ExprResult error_res;
+        error_res.value = create_null_value(); // Return a dummy error result
+        error_res.is_freshly_created_container = false;
+        error_res.is_standalone_primary_id = false;
+        return error_res;
     }
     
     ExprResult final_res;
@@ -948,148 +1994,36 @@ ExprResult interpret_multiplicative_expr(Interpreter* interpreter) {
     final_res.is_standalone_primary_id = is_standalone;
     return final_res;
 }
-// Helper to execute a function (or method if self_obj is not NULL) with pre-evaluated arguments
-Value execute_echoc_function(Interpreter* interpreter, Function* func_to_call, Object* self_obj, Value* call_args, bool* call_args_freshness, int arg_count, Token* call_site_token) {
-    int min_required_args = 0;
-    int expected_param_slots = func_to_call->param_count;
-    int params_to_check_for_caller_arity = expected_param_slots;
-
-    if (self_obj) { // Method call
-        params_to_check_for_caller_arity = expected_param_slots - 1; // Caller doesn't provide 'self'
-        for (int i = 1; i < expected_param_slots; ++i) { // Min required args, skipping 'self'
-            if (!func_to_call->params[i].default_value) {
-                min_required_args++;
-            }
-        }
-        if (arg_count < min_required_args || arg_count > params_to_check_for_caller_arity) {
-            // Free call_args before reporting error, as they were passed in
-            for(int i=0; i<arg_count; ++i) {
-                if(call_args_freshness[i]) free_value_contents(call_args[i]);
-            }
-            // A more robust way would be to pass freshness flags for call_args too.
-            char err_msg[250];
-            snprintf(err_msg, sizeof(err_msg), "Method '%s' expects %d arguments (excluding self, %d required), but %d were given.",
-                     func_to_call->name, params_to_check_for_caller_arity, min_required_args, arg_count);
-            report_error("Runtime", err_msg, call_site_token);
-        }
-    } else { // Regular function call
-        for (int i = 0; i < expected_param_slots; ++i) {
-            if (!func_to_call->params[i].default_value) {
-                min_required_args++;
-            }
-        }
-        if (arg_count < min_required_args || arg_count > expected_param_slots) {
-            for(int i=0; i<arg_count; ++i) {
-                if(call_args_freshness[i]) free_value_contents(call_args[i]);
-            }
-
-            char err_msg[250];
-            snprintf(err_msg, sizeof(err_msg), "Function '%s' expects %d arguments (%d required), but %d were given.",
-                     func_to_call->name, expected_param_slots, min_required_args, arg_count);
-            report_error("Runtime", err_msg, call_site_token);
-        }
-    }
-
-    Scope* old_scope = interpreter->current_scope;
-    Object* old_self_obj_ctx = interpreter->current_self_object;
-
-    interpreter->current_scope = func_to_call->definition_scope;
-    enter_scope(interpreter);
-    if (self_obj) {
-        interpreter->current_self_object = self_obj;
-        // Manually insert 'self' to ensure it's a direct reference, not a deep copy.
-        SymbolNode* self_node = (SymbolNode*)malloc(sizeof(SymbolNode));
-        if (!self_node) report_error("System", "Failed to allocate memory for 'self' symbol node in method scope", call_site_token);
-        
-        self_node->name = strdup("self");
-        if (!self_node->name) { free(self_node); report_error("System", "Failed to strdup 'self' name for method scope", call_site_token); }
-        
-        self_node->value.type = VAL_OBJECT;
-        self_node->value.as.object_val = self_obj; // Direct pointer assignment
-        
-        self_node->next = interpreter->current_scope->symbols;
-        interpreter->current_scope->symbols = self_node;
-        DEBUG_PRINTF("Manually set 'self' in method scope (execute_echoc_function) %p, pointing to Object %p", (void*)interpreter->current_scope, (void*)self_obj);
-    } else {
-        interpreter->current_self_object = NULL; // No 'self' for regular functions
-    }
-
-    int current_arg_idx = 0;
-    for (int i = (self_obj ? 1 : 0); i < func_to_call->param_count; ++i) { // Skip param 0 if 'self'
-        if (current_arg_idx < arg_count) {
-            // symbol_table_set makes a deep copy, so call_args[current_arg_idx] can be freed if it was fresh.
-            symbol_table_set(interpreter->current_scope, func_to_call->params[i].name, call_args[current_arg_idx]);
-            if (call_args_freshness[current_arg_idx]) { // Only free if it was a fresh temporary
-                free_value_contents(call_args[current_arg_idx]);
-            }
-            current_arg_idx++;
-        } else {
-            if (!func_to_call->params[i].default_value) { /* Should be caught by arity */ }
-            symbol_table_set(interpreter->current_scope, func_to_call->params[i].name, *(func_to_call->params[i].default_value));
-        } // Default values are already deep copied when Function struct is made or stored.
-    }
-
-    LexerState old_lexer_state = get_lexer_state(interpreter->lexer);
-    Token* old_current_token = token_deep_copy(interpreter->current_token);
-
-    // Prepare and set lexer state for function body execution
-    LexerState effective_body_start_state = func_to_call->body_start_state;
-    effective_body_start_state.text = func_to_call->source_text_owned_copy;
-    effective_body_start_state.text_length = func_to_call->source_text_length;
-    set_lexer_state(interpreter->lexer, effective_body_start_state);
-
-    free_token(interpreter->current_token);
-    interpreter->current_token = get_next_token(interpreter->lexer);
-
-    interpreter->function_nesting_level++;
-    interpreter->return_flag = 0;
-    free_value_contents(interpreter->current_function_return_value);
-    interpreter->current_function_return_value = create_null_value();
-
-    while (!(interpreter->current_token->type == TOKEN_END &&
-             (func_to_call->body_end_token_original_line == -1 || // Handle case where body might be empty and end token not pre-scanned
-              (interpreter->current_token->line == func_to_call->body_end_token_original_line &&
-               interpreter->current_token->col == func_to_call->body_end_token_original_col))) &&
-           interpreter->current_token->type != TOKEN_EOF) {
-        interpret_statement(interpreter);
-        if (interpreter->exception_is_active && func_to_call->body_end_token_original_line == -1) {
-            // If exception in a function with no pre-scanned end (e.g. op_str), ensure we break
-        }
-        if (interpreter->return_flag || interpreter->break_flag || interpreter->continue_flag || interpreter->exception_is_active) break;
-    }
-
-    interpreter->function_nesting_level--;
-    Value result = value_deep_copy(interpreter->current_function_return_value);
-    
-    // Free the contents of the interpreter's return value slot,
-    // as 'result' now holds the (copied) value to be returned.
-    // The original current_function_return_value might have been a temporary
-    // created by the 'return' statement's expression.
-    free_value_contents(interpreter->current_function_return_value);
-    interpreter->current_function_return_value = create_null_value(); // Reset for safety
-
-    set_lexer_state(interpreter->lexer, old_lexer_state);
-    free_token(interpreter->current_token);
-    interpreter->current_token = old_current_token;
-
-    exit_scope(interpreter);
-    interpreter->current_scope = old_scope;
-    interpreter->current_self_object = old_self_obj_ctx;
-    interpreter->return_flag = 0;
-    return result;
-}
 
 ExprResult interpret_additive_expr(Interpreter* interpreter) {
     ExprResult left_res = interpret_multiplicative_expr(interpreter);
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
+
+    // Value left = left_res.value; // This will be used later in the correct function body
+
+    // Actual interpret_additive_expr logic continues here
     Value left = left_res.value;
     bool current_res_is_fresh = left_res.is_freshly_created_container;
     bool is_standalone = left_res.is_standalone_primary_id;
 
     while (interpreter->current_token->type == TOKEN_PLUS || interpreter->current_token->type == TOKEN_MINUS) {
         TokenType op_type = interpreter->current_token->type;
-        Token* op_token = interpreter->current_token;
+
+        // --- FIX: Deep copy the operator token before it's eaten ---
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
+
         interpreter_eat(interpreter, op_type);
         ExprResult right_res = interpret_multiplicative_expr(interpreter);
+
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            if (current_res_is_fresh) free_value_contents(left); // Free the left-side value if it was a temporary.
+            if (right_res.is_freshly_created_container) free_value_contents(right_res.value);
+            free_token(op_token_copy);
+            return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
+        }
+
         Value right = right_res.value;
         bool right_is_fresh = right_res.is_freshly_created_container;
         
@@ -1121,14 +2055,16 @@ ExprResult interpret_additive_expr(Interpreter* interpreter) {
                 else if (right.type == VAL_INT) { snprintf(s2_buf, sizeof(s2_buf), "%ld", right.as.integer); s2_ptr = s2_buf; }
                 else { snprintf(s2_buf, sizeof(s2_buf), "%g", right.as.floating); s2_ptr = s2_buf; }
 
-                char* new_str = malloc(strlen(s1_ptr) + strlen(s2_ptr) + 1);
-                if (!new_str) report_error("System", "Memory allocation failed for string concatenation", op_token);
-                strcpy(new_str, s1_ptr); strcat(new_str, s2_ptr);
-                result_val.type = VAL_STRING; result_val.as.string_val = new_str;
+                DynamicString ds_concat;
+                ds_init(&ds_concat, strlen(s1_ptr) + strlen(s2_ptr) + 1); // Initial capacity
+                ds_append_str(&ds_concat, s1_ptr);
+                ds_append_str(&ds_concat, s2_ptr);
+
+                result_val.type = VAL_STRING;
+                result_val.as.string_val = ds_finalize(&ds_concat);
                 new_op_res_is_fresh = true; // New string
             } else {
-                // Check for operator overloading (op_add)
-                if (left.type == VAL_OBJECT) {
+                if (left.type == VAL_OBJECT) { // op_add attempt
                     Object* left_obj = left.as.object_val;
                     Value* op_add_method_val = NULL;
                     Blueprint* current_bp = left_obj->blueprint;
@@ -1140,45 +2076,47 @@ ExprResult interpret_additive_expr(Interpreter* interpreter) {
                     }
 
                     if (op_add_method_val) {
-                        Value call_args[1];
-                        call_args[0] = value_deep_copy(right); // Pass 'right' as the argument to op_add. value_deep_copy makes it fresh.
-                        bool arg_freshness[1] = {true}; // The copied 'right' argument is fresh.
+                        ParsedArgument parsed_args[1];
+                        parsed_args[0].name = NULL; // It's a positional argument
+                        parsed_args[0].value = value_deep_copy(right);
+                        parsed_args[0].is_fresh = true;
 
-                        result_val = execute_echoc_function(interpreter, op_add_method_val->as.function_val, left_obj, call_args, arg_freshness, 1, op_token);
-                        // execute_echoc_function is responsible for freeing the contents of call_args elements
-                        // after they've been used (copied into the function's scope).
-                        // So, no free_value_contents(call_args[0]) here.
-                        // If op_add returns an object/array/dict, it's considered fresh
-                        if (result_val.type == VAL_OBJECT || result_val.type == VAL_ARRAY || result_val.type == VAL_DICT) {
+                        result_val = execute_echoc_function(interpreter, op_add_method_val->as.function_val, left_obj, parsed_args, 1, op_token_copy);
+                        // execute_echoc_function handles freeing call_args elements.
+                        if (result_val.type >= VAL_STRING && result_val.type <= VAL_GATHER_TASK && result_val.type != VAL_BLUEPRINT && result_val.type != VAL_SUPER_PROXY) {
                             new_op_res_is_fresh = true;
                         }
                     } else {
+                        // op_add not found on object
                         if(current_res_is_fresh) free_value_contents(left);
                         if(right_is_fresh) free_value_contents(right);
-                        report_error("Runtime", "Unsupported operand types for '+' operator (and no op_add method found).", op_token);
+                        report_error("Runtime", "Object does not support '+' operator (missing op_add method).", op_token_copy);
+                        // free_token(op_token_copy); // report_error exits, so this is not strictly needed but good for consistency if it didn't
                     }
-                } else { 
+                } else { // Fallback if not VAL_OBJECT (and not numeric/string)
                     if(current_res_is_fresh) free_value_contents(left);
                     if(right_is_fresh) free_value_contents(right);
-                    report_error("Runtime", "Unsupported operand types for '+' operator.", op_token);
+                    report_error("Runtime", "Unsupported operand types for '+' operator.", op_token_copy);
+                    // free_token(op_token_copy); // report_error exits
                 }
-                new_op_res_is_fresh = false;
             }
         } else { // TOKEN_MINUS
-            if (!((left.type == VAL_INT || left.type == VAL_FLOAT) && (right.type == VAL_INT || right.type == VAL_FLOAT))) {
-                if(current_res_is_fresh) free_value_contents(left); else if (left.type != VAL_INT && left.type != VAL_FLOAT) free_value_contents(left);
-                if(right_is_fresh) free_value_contents(right); else if (right.type != VAL_INT && right.type != VAL_FLOAT) free_value_contents(right);
-                report_error("Runtime", "Operands for '-' must both be numbers.", op_token);
+           if (!((left.type == VAL_INT || left.type == VAL_FLOAT) && (right.type == VAL_INT || right.type == VAL_FLOAT))) {
+                if(current_res_is_fresh) free_value_contents(left);
+                if(right_is_fresh) free_value_contents(right);
+                report_error("Runtime", "Operands for '-' must both be numbers.", op_token_copy);
+                // free_token(op_token_copy); // report_error exits
             }
+            // If types are correct, proceed with calculation
             double left_val = (left.type == VAL_INT) ? left.as.integer : left.as.floating;
             double right_val = (right.type == VAL_INT) ? right.as.integer : right.as.floating;
-            // Promote to float if either is float, otherwise int.
+            
             if (left.type == VAL_FLOAT || right.type == VAL_FLOAT) {
                  result_val.type = VAL_FLOAT;
                  result_val.as.floating = left_val - right_val;
             } else { // Both VAL_INT
                  result_val.type = VAL_INT;
-                 result_val.as.integer = (long)(left_val - right_val); // Explicit cast of result
+                 result_val.as.integer = (long)(left_val - right_val);
             }
             new_op_res_is_fresh = false; // Numeric result
         }
@@ -1188,38 +2126,280 @@ ExprResult interpret_additive_expr(Interpreter* interpreter) {
 
         left = result_val;
         current_res_is_fresh = new_op_res_is_fresh;
+
+        // --- FIX: Free the copied token at the end of the loop iteration ---
+        free_token(op_token_copy);
     }
 
     ExprResult final_res;
     final_res.value = left;
     final_res.is_freshly_created_container = current_res_is_fresh;
     final_res.is_standalone_primary_id = is_standalone;
-    return final_res;
+   return final_res;
+}
+
+// Implementation of execute_echoc_function
+Value execute_echoc_function(Interpreter* interpreter, Function* func_to_call, Object* self_obj, ParsedArgument* parsed_args, int arg_count, Token* call_site_token) {
+    // START: Short-circuit check
+    if (interpreter->prevent_side_effects) {
+        // In a short-circuited expression, we don't execute the function.
+        // The arguments have already been "dry-run" parsed by the caller to advance the lexer.
+        // We just need to clean them up and return a dummy value.
+        for (int i = 0; i < arg_count; ++i) {
+            if (parsed_args[i].name) free(parsed_args[i].name);
+            // The value is a dummy from a dry-run, no complex contents to free.
+        }
+        return create_null_value();
+    }
+    // END: Short-circuit check
+
+    // --- START: C Function Dispatch ---
+    if (func_to_call->c_impl) {
+        // This is a C function wrapped in a VAL_FUNCTION.
+        // Convert ParsedArgument to simple Value array and disallow named args for now.
+        Value simple_args[arg_count];
+        for (int i = 0; i < arg_count; ++i) {
+            if (parsed_args[i].name) {
+                char err_msg[250];
+                snprintf(err_msg, sizeof(err_msg), "Built-in module function '%s' does not support named arguments.", func_to_call->name);
+                report_error("Runtime", err_msg, call_site_token);
+            }
+            simple_args[i] = parsed_args[i].value;
+        }
+        // The C function is responsible for its own argument validation.
+        Value result = func_to_call->c_impl(interpreter, simple_args, arg_count, call_site_token);
+
+        // After the C function is called, we must clean up the original parsed arguments.
+        // The C function does not take ownership of the argument values' contents, so the
+        // caller (`execute_echoc_function`) is responsible for freeing any temporary containers.
+        for (int i = 0; i < arg_count; ++i) {
+            if (parsed_args[i].name) free(parsed_args[i].name);
+            if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+        }
+
+        // Now that cleanup is done, return the result from the C function.
+        return result;
+    }
+    // --- END: C Function Dispatch ---
+
+    int param_count = func_to_call->param_count;
+    int self_offset = self_obj ? 1 : 0;
+    int non_self_param_count = param_count - self_offset;
+
+    // --- REFACTORED ARGUMENT AND SCOPE HANDLING ---
+
+    // 1. Setup the new scope for the function call first.
+    Scope* old_scope = interpreter->current_scope;
+    Object* old_self_obj_ctx = interpreter->current_self_object;
+
+    interpreter->current_scope = func_to_call->definition_scope;
+    enter_scope(interpreter); // This new scope is now interpreter->current_scope
+
+    if (self_obj) {
+        interpreter->current_self_object = self_obj;
+        // Manually insert 'self' to ensure it's a direct reference, not a deep copy.
+        SymbolNode* self_node = (SymbolNode*)malloc(sizeof(SymbolNode));
+        if (!self_node) report_error("System", "Failed to allocate memory for 'self' symbol node in method scope", call_site_token);
+        
+        self_node->name = strdup("self");
+        if (!self_node->name) { free(self_node); report_error("System", "Failed to strdup 'self' name for method scope", call_site_token); }
+        
+        self_node->value.type = VAL_OBJECT;
+        self_node->value.as.object_val = self_obj; // Direct pointer assignment
+        
+        self_node->next = interpreter->current_scope->symbols;
+        interpreter->current_scope->symbols = self_node;
+        DEBUG_PRINTF("Manually set 'self' in method scope (execute_echoc_function) %p, pointing to Object %p", (void*)interpreter->current_scope, (void*)self_obj);
+    } else {
+        interpreter->current_self_object = NULL; // No 'self' for regular functions
+    }
+
+    bool arg_was_provided[param_count];
+    for (int i = 0; i < param_count; ++i) {
+        arg_was_provided[i] = false;
+    }
+
+    #define CLEANUP_AND_REPORT(msg, token) do { \
+        for (int i = 0; i < arg_count; ++i) { \
+            if (parsed_args[i].name) free(parsed_args[i].name); \
+            if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value); \
+        } \
+        exit_scope(interpreter); \
+        interpreter->current_scope = old_scope; \
+        interpreter->current_self_object = old_self_obj_ctx; \
+        report_error("Runtime", msg, token); \
+    } while (0)
+
+    // 2. Process positional arguments
+    int positional_arg_count = 0;
+    for (int i = 0; i < arg_count; ++i) {
+        if (parsed_args[i].name == NULL) {
+            positional_arg_count++;
+        }
+    }
+
+    if (positional_arg_count > non_self_param_count) {
+        char err_msg[250];
+        snprintf(err_msg, sizeof(err_msg), "%s() takes %d positional argument(s) but %d were given.",
+                 func_to_call->name, non_self_param_count, positional_arg_count);
+        CLEANUP_AND_REPORT(err_msg, call_site_token);
+    }
+
+    int current_pos_arg = 0;
+    for (int i = 0; i < arg_count; ++i) {
+        if (parsed_args[i].name == NULL) {
+            int param_idx = current_pos_arg + self_offset;
+            // Directly set the argument in the new scope. symbol_table_set handles the deep copy.
+            symbol_table_set(interpreter->current_scope, func_to_call->params[param_idx].name, parsed_args[i].value);
+            arg_was_provided[param_idx] = true;
+            current_pos_arg++;
+        }
+    }
+
+    // 3. Process named arguments
+    for (int i = 0; i < arg_count; ++i) {
+        if (parsed_args[i].name != NULL) {
+            bool param_found = false;
+            for (int j = self_offset; j < param_count; ++j) {
+                if (strcmp(func_to_call->params[j].name, parsed_args[i].name) == 0) {
+                    if (arg_was_provided[j]) {
+                        char err_msg[250];
+                        snprintf(err_msg, sizeof(err_msg), "%s() got multiple values for argument '%s'.",
+                                 func_to_call->name, parsed_args[i].name);
+                        CLEANUP_AND_REPORT(err_msg, call_site_token);
+                    }
+                    symbol_table_set(interpreter->current_scope, func_to_call->params[j].name, parsed_args[i].value);
+                    arg_was_provided[j] = true;
+                    param_found = true;
+                    break;
+                }
+            }
+            if (!param_found) {
+                char err_msg[250];
+                snprintf(err_msg, sizeof(err_msg), "%s() got an unexpected keyword argument '%s'.",
+                         func_to_call->name, parsed_args[i].name);
+                CLEANUP_AND_REPORT(err_msg, call_site_token);
+            }
+        }
+    }
+
+    // 4. Fill in defaults and check for missing required args
+    for (int i = self_offset; i < param_count; ++i) {
+        if (!arg_was_provided[i]) {
+            if (func_to_call->params[i].default_value) {
+                symbol_table_set(interpreter->current_scope, func_to_call->params[i].name, *(func_to_call->params[i].default_value));
+            } else {
+                char err_msg[250];
+                snprintf(err_msg, sizeof(err_msg), "%s() missing 1 required positional argument: '%s'.",
+                         func_to_call->name, func_to_call->params[i].name);
+                CLEANUP_AND_REPORT(err_msg, call_site_token);
+            }
+        }
+    }
+    #undef CLEANUP_AND_REPORT
+
+    // 5. Cleanup parsed_args. This is now safe as all necessary values have been copied to the new scope.
+    for (int i = 0; i < arg_count; ++i) {
+        if (parsed_args[i].name) free(parsed_args[i].name);
+        if (parsed_args[i].is_fresh) free_value_contents(parsed_args[i].value);
+    }
+
+    // --- END REFACTOR ---
+
+    LexerState old_lexer_state = get_lexer_state(interpreter->lexer);
+    Token* old_current_token = token_deep_copy(interpreter->current_token);
+
+
+    // Prepare and set lexer state for function body execution
+    LexerState effective_body_start_state = func_to_call->body_start_state;
+    effective_body_start_state.text = func_to_call->source_text_owned_copy;
+    effective_body_start_state.text_length = func_to_call->source_text_length;
+    set_lexer_state(interpreter->lexer, effective_body_start_state);
+
+    free_token(interpreter->current_token);
+    interpreter->current_token = get_next_token(interpreter->lexer);
+
+    interpreter->function_nesting_level++;
+    interpreter->return_flag = 0;
+    free_value_contents(interpreter->current_function_return_value);
+    interpreter->current_function_return_value = create_null_value();
+
+    // Loop as long as the current token is part of the function body (i.e., indented more than the function definition)
+    while (interpreter->current_token->col > func_to_call->definition_col &&
+           // Also stop if we hit EOF, which implies an unclosed function.
+           interpreter->current_token->type != TOKEN_EOF) {
+        interpret_statement(interpreter);
+        if (interpreter->exception_is_active && func_to_call->body_end_token_original_line == -1) {
+            // If exception in a function with no pre-scanned end (e.g. op_str), ensure we break
+        }
+         if (interpreter->return_flag || interpreter->break_flag || interpreter->continue_flag || interpreter->exception_is_active) {
+             break;
+         }
+    }
+ 
+    if (interpreter->exception_is_active) {
+        if (interpreter->error_token) free_token(interpreter->error_token);
+        interpreter->error_token = token_deep_copy(call_site_token);
+    }
+
+    interpreter->function_nesting_level--;
+
+    Value result = value_deep_copy(interpreter->current_function_return_value);
+    
+    free_value_contents(interpreter->current_function_return_value);
+    interpreter->current_function_return_value = create_null_value(); // Reset for safety
+
+    set_lexer_state(interpreter->lexer, old_lexer_state);
+    free_token(interpreter->current_token);
+    interpreter->current_token = old_current_token;
+
+    exit_scope(interpreter);
+    interpreter->current_scope = old_scope;
+    interpreter->current_self_object = old_self_obj_ctx;
+    interpreter->return_flag = 0;
+    return result;
 }
 
 ExprResult interpret_comparison_expr(Interpreter* interpreter) {
     ExprResult left_res = interpret_additive_expr(interpreter);
-    // We will operate on left_res directly or its components.
+    if (interpreter->exception_is_active) return left_res; // Propagate error result up
+
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
 
     while (interpreter->current_token->type == TOKEN_LT || interpreter->current_token->type == TOKEN_GT ||
            interpreter->current_token->type == TOKEN_LTE || interpreter->current_token->type == TOKEN_GTE) {
+
+        // --- FIX: Deep copy the operator token before it's eaten ---
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
         TokenType op_type = interpreter->current_token->type;
-        Token* op_token = interpreter->current_token;
+
         interpreter_eat(interpreter, op_type);
         ExprResult right_res = interpret_additive_expr(interpreter);
 
-        if (!((left_res.value.type == VAL_INT || left_res.value.type == VAL_FLOAT) &&
-              (right_res.value.type == VAL_INT || right_res.value.type == VAL_FLOAT))) {
-            // Free operands if they were fresh containers before reporting error
-            if (left_res.is_freshly_created_container) free_value_contents(left_res.value);
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            if (left_res.is_freshly_created_container) free_value_contents(left_res.value); // Free the left-side value if it was a temporary.
             if (right_res.is_freshly_created_container) free_value_contents(right_res.value);
-            char err_msg[100];
-            sprintf(err_msg, "Operands for comparison operator '%s' must be numbers.", op_token->value);
-            report_error("Runtime", err_msg, op_token);
+            free_token(op_token_copy);
+            return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
         }
 
+        Value right = right_res.value;
+
+        if (!((left_res.value.type == VAL_INT || left_res.value.type == VAL_FLOAT) &&
+              (right.type == VAL_INT || right.type == VAL_FLOAT))) {
+            // Free operands if they were fresh containers before reporting error
+            if (left_res.is_freshly_created_container && left_res.value.type != VAL_NULL) free_value_contents(left_res.value);
+            if (right_res.is_freshly_created_container && right_res.value.type != VAL_NULL) free_value_contents(right_res.value);
+            char err_msg[100];
+            // --- FIX: Use op_token_copy for error reporting ---
+            snprintf(err_msg, sizeof(err_msg), "Operands for comparison operator '%s' must be numbers.", op_token_copy->value);
+            report_error("Runtime", err_msg, op_token_copy);
+        }
+        
         double left_val = (left_res.value.type == VAL_INT) ? (double)left_res.value.as.integer : left_res.value.as.floating;
-        double right_val = (right_res.value.type == VAL_INT) ? (double)right_res.value.as.integer : right_res.value.as.floating;
+        double right_val = (right.type == VAL_INT) ? (double)right.as.integer : right.as.floating;
 
         Value result_val;
         result_val.type = VAL_BOOL;
@@ -1235,6 +2415,9 @@ ExprResult interpret_comparison_expr(Interpreter* interpreter) {
         left_res.value = result_val; // Update left_res with the new boolean result
         left_res.is_freshly_created_container = false; // Boolean is not a fresh container
         left_res.is_standalone_primary_id = false; // Result of comparison
+
+        // --- FIX: Free the copied token ---
+        free_token(op_token_copy);
     }
 
     // If the loop was entered, left_res was updated.
@@ -1242,14 +2425,77 @@ ExprResult interpret_comparison_expr(Interpreter* interpreter) {
     return left_res;
 }
 
-ExprResult interpret_equality_expr(Interpreter* interpreter) {
+ExprResult interpret_identity_expr(Interpreter* interpreter) {
     ExprResult left_res = interpret_comparison_expr(interpreter);
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
+
+    while (interpreter->current_token->type == TOKEN_IS) {
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
+        interpreter_eat(interpreter, TOKEN_IS);
+
+        bool is_not = false;
+        if (interpreter->current_token->type == TOKEN_NOT) {
+            is_not = true;
+            interpreter_eat(interpreter, TOKEN_NOT);
+        }
+
+        ExprResult right_res = interpret_comparison_expr(interpreter);
+
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            if (left_res.is_freshly_created_container) free_value_contents(left_res.value);
+            if (right_res.is_freshly_created_container) free_value_contents(right_res.value);
+            free_token(op_token_copy);
+            return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
+        }
+
+        Value result_val;
+        result_val.type = VAL_BOOL;
+
+        bool are_identical = values_are_identical(left_res.value, right_res.value);
+
+        result_val.as.bool_val = is_not ? !are_identical : are_identical;
+
+        if(left_res.is_freshly_created_container) free_value_contents(left_res.value);
+        if(right_res.is_freshly_created_container) free_value_contents(right_res.value);
+
+        left_res.value = result_val;
+        left_res.is_freshly_created_container = false;
+        left_res.is_standalone_primary_id = false;
+
+        free_token(op_token_copy);
+    }
+
+    return left_res;
+}
+
+ExprResult interpret_equality_expr(Interpreter* interpreter) {
+    ExprResult left_res = interpret_identity_expr(interpreter);
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
+
     // Value left = left_res.value; // Operate on left_res directly
 
     while (interpreter->current_token->type == TOKEN_EQ || interpreter->current_token->type == TOKEN_NEQ) {
+
+        // --- FIX: Deep copy the operator token before it's eaten ---
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
         TokenType op_type = interpreter->current_token->type;
-        /* Token* op_token = interpreter->current_token; */ interpreter_eat(interpreter, op_type);
-        ExprResult right_res = interpret_comparison_expr(interpreter);
+
+        interpreter_eat(interpreter, op_type);
+        ExprResult right_res = interpret_identity_expr(interpreter); // This will be the token for error reporting if types mismatch badly
+
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            if (left_res.is_freshly_created_container) free_value_contents(left_res.value); // Free the left-side value if it was a temporary.
+            if (right_res.is_freshly_created_container) {
+                free_value_contents(right_res.value);
+            }
+            free_token(op_token_copy);
+            return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
+        }
+
         // Value right = right_res.value;
 
         Value result_val;
@@ -1257,39 +2503,9 @@ ExprResult interpret_equality_expr(Interpreter* interpreter) {
 
         int are_equal = 0; // Assume not equal by default
 
-        // Handle numeric and bool comparisons with potential type coercion
-        if ((left_res.value.type == VAL_INT || left_res.value.type == VAL_FLOAT || left_res.value.type == VAL_BOOL) &&
-            (right_res.value.type == VAL_INT || right_res.value.type == VAL_FLOAT || right_res.value.type == VAL_BOOL)) {
-            
-            double left_num, right_num;
-
-            if (left_res.value.type == VAL_BOOL) left_num = left_res.value.as.bool_val ? 1.0 : 0.0;
-            else if (left_res.value.type == VAL_INT) left_num = (double)left_res.value.as.integer;
-            else left_num = left_res.value.as.floating; // VAL_FLOAT
-
-            if (right_res.value.type == VAL_BOOL) right_num = right_res.value.as.bool_val ? 1.0 : 0.0;
-            else if (right_res.value.type == VAL_INT) right_num = (double)right_res.value.as.integer;
-            else right_num = right_res.value.as.floating; // VAL_FLOAT
-            
-            are_equal = (left_num == right_num);
-
-        } else if (left_res.value.type == VAL_STRING && right_res.value.type == VAL_STRING) {
-            are_equal = (strcmp(left_res.value.as.string_val, right_res.value.as.string_val) == 0);
-        } else if (left_res.value.type == VAL_ARRAY && right_res.value.type == VAL_ARRAY) {
-            // TODO: Define array equality (e.g., by reference or deep comparison)
-            // For now, different array instances are not equal.
-            are_equal = (left_res.value.as.array_val == right_res.value.as.array_val);
-        } else if (left_res.value.type == VAL_TUPLE && right_res.value.type == VAL_TUPLE) {
-            // TODO: Define tuple equality
-            are_equal = (left_res.value.as.tuple_val == right_res.value.as.tuple_val);
-        } else if (left_res.value.type == VAL_DICT && right_res.value.type == VAL_DICT) {
-            // TODO: Define dictionary equality
-            are_equal = (left_res.value.as.dict_val == right_res.value.as.dict_val);
-        } else if (left_res.value.type != right_res.value.type) {
-            // Different types not handled above are not equal.
-            are_equal = 0;
-        }
-        // If types are the same but not handled above (e.g. custom types in future), they are not equal.
+        // Use the new helper function for deep equality.
+        // Pass the token of the equality operator (or the right operand's start) for error context if needed by values_are_deep_equal.
+        are_equal = values_are_deep_equal(interpreter, left_res.value, right_res.value, op_token_copy);
 
         result_val.as.bool_val = (op_type == TOKEN_EQ) ? are_equal : !are_equal;
         
@@ -1300,48 +2516,52 @@ ExprResult interpret_equality_expr(Interpreter* interpreter) {
         left_res.value = result_val; // Update left_res
         left_res.is_freshly_created_container = false; // Boolean is not a fresh container
         left_res.is_standalone_primary_id = false; // Result of equality op
+
+        // --- FIX: Free the copied token ---
+        free_token(op_token_copy);
     }
 
     // If loop was entered, left_res was updated.
     // If not, original left_res is returned.
     return left_res;
 }
-
 ExprResult interpret_logical_and_expr(Interpreter* interpreter) {
     ExprResult left_res = interpret_equality_expr(interpreter);
-    // Value left = left_res.value; // Operate on left_res directly
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
 
     while (interpreter->current_token->type == TOKEN_AND) {
-        Token* op_token = interpreter->current_token;
+
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
         interpreter_eat(interpreter, TOKEN_AND);
         
-        if (left_res.value.type == VAL_BOOL && !left_res.value.as.bool_val) { // Short-circuit
-            ExprResult right_dummy_res = interpret_equality_expr(interpreter);
+        if (!value_is_truthy(left_res.value)) {
+            // Short-circuit: LHS is falsy, so the result is the LHS.
+            // We must skip the RHS expression without evaluating its side effects.
+            interpreter->prevent_side_effects = true;
+            ExprResult right_dummy_res = interpret_equality_expr(interpreter); // This will just skip tokens
+            interpreter->prevent_side_effects = false;
+
+            // The dummy result should not have any allocated content, but we check just in case.
             if (right_dummy_res.is_freshly_created_container) free_value_contents(right_dummy_res.value);
-            // left_res.value is already false (VAL_BOOL).
-            // If left_res was a fresh container that evaluated to false (e.g. empty string in future), it should be freed.
-            // However, current boolean conversion is direct. For now, this is okay.
-            left_res.is_standalone_primary_id = false; // Result of 'and'
+
+            // The result of the 'and' operation is the original falsy LHS value.
+            // We just continue the loop, and since left_res is still falsy, we'll keep short-circuiting.
         } else {
+            // LHS is truthy. The result of the expression so far is the RHS.
+            // We must evaluate the RHS normally.
+            if (left_res.is_freshly_created_container) free_value_contents(left_res.value); // Free the old truthy LHS value
             ExprResult right_res = interpret_equality_expr(interpreter);
-            Value right = right_res.value;
-            if (left_res.value.type != VAL_BOOL || right.type != VAL_BOOL) {
-                // Free original left_res.value and right_res.value if they were fresh containers
-                if(left_res.is_freshly_created_container) free_value_contents(left_res.value);
-                if(right_res.is_freshly_created_container) free_value_contents(right); // right is right_res.value
-                report_error("Runtime", "Operands for 'and' must be booleans.", op_token);
+            if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+                // RHS yielded/errored. The LHS was already freed. Just propagate the dummy result.
+                free_token(op_token_copy);
+                return right_res;
             }
-            Value result_val;
-            result_val.type = VAL_BOOL;
-            result_val.as.bool_val = left_res.value.as.bool_val && right.as.bool_val;
+            left_res = right_res; // The new "left" for the next iteration is the result of the RHS.
 
-            if(left_res.is_freshly_created_container) free_value_contents(left_res.value);
-            if(right_res.is_freshly_created_container) free_value_contents(right_res.value);
-
-            left_res.value = result_val;
-            left_res.is_freshly_created_container = false;
-            left_res.is_standalone_primary_id = false; // Result of 'and'
         }
+        free_token(op_token_copy);
     }
 
     return left_res;
@@ -1349,639 +2569,267 @@ ExprResult interpret_logical_and_expr(Interpreter* interpreter) {
 
 ExprResult interpret_logical_or_expr(Interpreter* interpreter) {
     ExprResult left_res = interpret_logical_and_expr(interpreter);
-    // Value left = left_res.value; // Operate on left_res directly
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return left_res;
+    }
 
     while (interpreter->current_token->type == TOKEN_OR) {
-        Token* op_token = interpreter->current_token;
+
+        Token* op_token_copy = token_deep_copy(interpreter->current_token);
         interpreter_eat(interpreter, TOKEN_OR);
 
-        if (left_res.value.type == VAL_BOOL && left_res.value.as.bool_val) { // Short-circuit
-            ExprResult right_dummy_res = interpret_logical_and_expr(interpreter);
+        if (value_is_truthy(left_res.value)) {
+            // Short-circuit: LHS is truthy, so the result is the LHS.
+            // We must skip the RHS expression without evaluating its side effects.
+            interpreter->prevent_side_effects = true;
+            ExprResult right_dummy_res = interpret_logical_and_expr(interpreter); // This will just skip tokens
+            interpreter->prevent_side_effects = false;
+
+            // The dummy result should not have any allocated content, but we check just in case.
             if (right_dummy_res.is_freshly_created_container) free_value_contents(right_dummy_res.value);
-            left_res.is_standalone_primary_id = false; // Result of 'or'
+
+            // The result of the 'or' operation is the original truthy LHS value.
+            // We just continue the loop, and since left_res is still truthy, we'll keep short-circuiting.
         } else {
+            // LHS is falsy. The result of the expression so far is the RHS.
+            // We must evaluate the RHS normally.
+            if (left_res.is_freshly_created_container) free_value_contents(left_res.value); // Free the old falsy LHS value
             ExprResult right_res = interpret_logical_and_expr(interpreter);
-            Value right = right_res.value;
-
-            if (left_res.value.type != VAL_BOOL || right.type != VAL_BOOL) {
-                // Free original left_res.value and right_res.value if they were fresh containers
-                if(left_res.is_freshly_created_container) free_value_contents(left_res.value);
-                if(right_res.is_freshly_created_container) free_value_contents(right); // right is right_res.value
-                report_error("Runtime", "Operands for 'or' must be booleans.", op_token);
+            if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+                // RHS yielded/errored. The LHS was already freed. Just propagate the dummy result.
+                free_token(op_token_copy);
+                return right_res;
             }
-            Value result_val;
-            result_val.type = VAL_BOOL;
-            result_val.as.bool_val = left_res.value.as.bool_val || right.as.bool_val;
 
-            if(left_res.is_freshly_created_container) free_value_contents(left_res.value);
-            if(right_res.is_freshly_created_container) free_value_contents(right_res.value);
-
-            left_res.value = result_val;
-            left_res.is_freshly_created_container = false;
-            left_res.is_standalone_primary_id = false; // Result of 'or'
+            left_res = right_res; // The new "left" for the next iteration is the result of the RHS.
         }
+        free_token(op_token_copy);
     }
 
     return left_res;
 }
 
 
-ExprResult interpret_ternary_expr(Interpreter* interpreter) {
-    ExprResult cond_res = interpret_logical_or_expr(interpreter);
-    Value condition = cond_res.value;
-    // cond_res.is_standalone_primary_id is propagated if no ternary op
+ExprResult interpret_conditional_expr(Interpreter* interpreter) {
+    // New syntax: <true_expr> if <condition> else <false_expr>
+    // This has the lowest precedence.
 
-    if (interpreter->current_token->type == TOKEN_QUESTION) {
-        Token* q_token = interpreter->current_token; // For error context if condition is not bool
-        interpreter_eat(interpreter, TOKEN_QUESTION);
-
-        if (condition.type != VAL_BOOL) {
-            // cond_res.value is condition, which is VAL_BOOL if correct.
-            // If not, free its contents. cond_res.is_freshly_created_container is not used here.
-            free_value_contents(condition); 
-            report_error("Runtime", "Condition for ternary operator must be a boolean.", q_token);
-        }
-
-        // Parse both branches as logical-or expressions.
-        ExprResult true_expr_res = interpret_logical_or_expr(interpreter);
-        interpreter_eat(interpreter, TOKEN_COLON);
-        ExprResult false_expr_res = interpret_logical_or_expr(interpreter);
-
-        if (condition.as.bool_val) {
-            free_value_contents(false_expr_res.value); // Free the unused branch's value
-            true_expr_res.is_standalone_primary_id = false; // Result of ternary is not standalone ID
-            return true_expr_res; // Return the ExprResult of the chosen branch
-        } else {
-            free_value_contents(true_expr_res.value);
-            false_expr_res.is_standalone_primary_id = false; // Result of ternary is not standalone ID
-            return false_expr_res;
-        }
+    ExprResult true_expr_res = interpret_await_expr(interpreter);
+    if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+        return true_expr_res;
     }
-    return cond_res; // No ternary, return result of logical_or_expr
+
+    if (interpreter->current_token->type != TOKEN_IF) {
+        // Not a conditional expression, just return the result of the higher-precedence expression.
+        return true_expr_res;
+    }
+
+    // It's a conditional expression.
+    interpreter_eat(interpreter, TOKEN_IF);
+
+    ExprResult cond_res = interpret_await_expr(interpreter); // Parse the condition
+    if (interpreter->exception_is_active) {
+        if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+        if (true_expr_res.is_freshly_created_container) free_value_contents(true_expr_res.value);
+        return cond_res; // Propagate error
+    }
+
+    interpreter_eat(interpreter, TOKEN_ELSE);
+
+    ExprResult false_expr_res = interpret_await_expr(interpreter); // Parse the 'false' part
+    if (interpreter->exception_is_active) {
+        if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+        if (true_expr_res.is_freshly_created_container) free_value_contents(true_expr_res.value);
+        if (false_expr_res.is_freshly_created_container) free_value_contents(false_expr_res.value);
+        return false_expr_res; // Propagate error
+    }
+
+    // Now evaluate and return the correct branch
+    bool condition_is_truthy = value_is_truthy(cond_res.value);
+    if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+
+    if (condition_is_truthy) {
+        if (false_expr_res.is_freshly_created_container) free_value_contents(false_expr_res.value);
+        return true_expr_res;
+    } else {
+        if (true_expr_res.is_freshly_created_container) free_value_contents(true_expr_res.value);
+        return false_expr_res;
+    }
+    return cond_res; // No ternary, return result of the condition expression
 }
 
-// Placeholder for await expression
 ExprResult interpret_await_expr(Interpreter* interpreter) {
-    if (interpreter->current_token->type == TOKEN_AWAIT) {
-        interpreter_eat(interpreter, TOKEN_AWAIT);
+    Coroutine* self_coro = interpreter->current_executing_coroutine;
 
-        // Check if inside an async function context
-        if (!interpreter->current_executing_coroutine) {
-            report_error("Syntax", "'await' can only be used inside an 'async funct'.", interpreter->current_token);
-        }
-
-        Coroutine* self_coro = interpreter->current_executing_coroutine;
-
-        if (self_coro->is_resumed_from_await) {
-            self_coro->is_resumed_from_await = 0; // Reset flag
-            ExprResult resumed_result;
-            resumed_result.value = value_deep_copy(self_coro->value_from_await); // Get the stored result
-            free_value_contents(self_coro->value_from_await); // Clear the stored value
-            self_coro->value_from_await = create_null_value();
-
-            // Check if the awaited coroutine completed with an exception
-            if (self_coro->awaiting_on_coro && self_coro->awaiting_on_coro->has_exception) {
-                interpreter->exception_is_active = 1;
-                free_value_contents(interpreter->current_exception); // Free any old one
-                interpreter->current_exception = value_deep_copy(self_coro->awaiting_on_coro->exception_value);
-                // The await expression itself doesn't "return" a value in this case; it propagates the exception.
-                // We still need to return an ExprResult, but its value will be ignored.
-                resumed_result.value = create_null_value(); // Dummy value
-            } else if (self_coro->is_cancelled) { // Check if self_coro was cancelled while suspended
-                interpreter->exception_is_active = 1;
-                free_value_contents(interpreter->current_exception);
-                interpreter->current_exception.type = VAL_STRING;
-                interpreter->current_exception.as.string_val = strdup(CANCELLED_ERROR_MSG);
-                resumed_result.value = create_null_value();
-            } else {
-                resumed_result.value = value_deep_copy(self_coro->value_from_await); // Get the stored result
+    // If we are in fast-forward mode, we must check if this is the await we are looking for.
+    // If not, we skip this entire await expression to avoid executing it.
+    if (interpreter->prevent_side_effects) {
+        if (!self_coro || !self_coro->has_yielding_await_state ||
+            !(self_coro->yielding_await_token->line == interpreter->current_token->line &&
+              self_coro->yielding_await_token->col == interpreter->current_token->col))
+        {
+            // This is NOT the await we are resuming.
+            // If the current token is an await, we must dry-run it.
+            // Otherwise, we let the normal parsing functions handle it (they will respect prevent_side_effects).
+            if (interpreter->current_token->type == TOKEN_AWAIT) {
+                interpreter_eat(interpreter, TOKEN_AWAIT);
+                ExprResult dummy_res = interpret_logical_or_expr(interpreter); // This will also be in dry-run mode
+                if (dummy_res.is_freshly_created_container) free_value_contents(dummy_res.value);
+                return (ExprResult){ .value = create_null_value(), .is_freshly_created_container = false };
             }
-            free_value_contents(self_coro->value_from_await); self_coro->value_from_await = create_null_value();
-
-            if (resumed_result.value.type == VAL_STRING || resumed_result.value.type == VAL_ARRAY ||
-                resumed_result.value.type == VAL_DICT || resumed_result.value.type == VAL_TUPLE ||
-                resumed_result.value.type == VAL_OBJECT) {
-                resumed_result.is_freshly_created_container = true;
-            } else {
-                resumed_result.is_freshly_created_container = false;
-            }
-            resumed_result.is_standalone_primary_id = false;
-            return resumed_result;
         }
+        // If it IS the await we are resuming, we fall through to the main logic below.
+    }
 
-        ExprResult awaitable_expr_res = interpret_logical_or_expr(interpreter); // Parse the expression to await
-        if (awaitable_expr_res.value.type != VAL_COROUTINE && awaitable_expr_res.value.type != VAL_GATHER_TASK) {
-            free_value_contents(awaitable_expr_res.value);
-            report_error("Runtime", "Can only 'await' a coroutine.", interpreter->current_token);
+    if (interpreter->current_token->type != TOKEN_AWAIT) {
+        ExprResult res = interpret_logical_or_expr(interpreter);
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            return res;
         }
+        return res;
+    }
 
-        Coroutine* target_coro = awaitable_expr_res.value.as.coroutine_val;
+    // --- AWAIT RESUME LOGIC ---
+    if (self_coro && self_coro->has_yielding_await_state) { // Check if we are in a resume context
+        if (self_coro->yielding_await_token &&
+            self_coro->yielding_await_token->line == interpreter->current_token->line &&
+            self_coro->yielding_await_token->col == interpreter->current_token->col)
+        {
+            DEBUG_PRINTF("AWAIT_RESUME_MATCH: Resuming at the correct await. Fast-forward mode DISABLED.%s", "");
+            interpreter->prevent_side_effects = false; // Turn off fast-forward mode.
+            self_coro->has_yielding_await_state = false; // We have successfully resumed and consumed the state.
+            free_token(self_coro->yielding_await_token);
+            self_coro->yielding_await_token = NULL;
 
-        if (target_coro == self_coro) {
-            if (awaitable_expr_res.is_freshly_created_container) free_value_contents(awaitable_expr_res.value);
-            report_error("Runtime", "A coroutine cannot await itself.", interpreter->current_token);
-        }
-
-        // If the target coroutine is new, it needs to be scheduled.
-        if (target_coro->state == CORO_NEW) {
-            target_coro->state = CORO_RUNNABLE; // Mark as runnable
-            add_to_ready_queue(interpreter, target_coro);
-        }
-
-        if (target_coro->state == CORO_DONE) { // Await on already completed coroutine
-            if (awaitable_expr_res.is_freshly_created_container) free_value_contents(awaitable_expr_res.value);
-            ExprResult immediate_result;
-            if (target_coro->has_exception) {
+            ExprResult final_result;
+            if (self_coro->resumed_with_exception) {
                 interpreter->exception_is_active = 1;
                 free_value_contents(interpreter->current_exception);
-                interpreter->current_exception = value_deep_copy(target_coro->exception_value);
-                immediate_result.value = create_null_value(); // Dummy
+                interpreter->current_exception = value_deep_copy(self_coro->value_from_await);
+                final_result.value = create_null_value(); // Return dummy value on exception
             } else {
-                immediate_result.value = value_deep_copy(target_coro->result_value);
+                final_result.value = value_deep_copy(self_coro->value_from_await);
             }
-            immediate_result.is_freshly_created_container = (immediate_result.value.type >= VAL_STRING && immediate_result.value.type <= VAL_OBJECT);
-            immediate_result.is_standalone_primary_id = false;
-            return immediate_result;
-        } else if (target_coro->is_cancelled) { // Await on an already cancelled coroutine
-             if (awaitable_expr_res.is_freshly_created_container) free_value_contents(awaitable_expr_res.value);
+
+            final_result.is_freshly_created_container = true;
+            final_result.is_standalone_primary_id = false;
+
+            interpreter_eat(interpreter, TOKEN_AWAIT);
+            interpreter->prevent_side_effects = true;
+            ExprResult dummy_res = interpret_logical_or_expr(interpreter);
+            interpreter->prevent_side_effects = false;
+
+            if (dummy_res.is_freshly_created_container) {
+                free_value_contents(dummy_res.value);
+            }
+
+            return final_result; // Return the actual result from the completed await.
+        }
+    }
+
+    Token* await_keyword_token = token_deep_copy(interpreter->current_token);
+
+    if (!self_coro) {
+        report_error("Syntax", "'await' can only be used inside an 'async funct'.", await_keyword_token);
+    }
+
+    Coroutine* target_coro = NULL;
+
+    // --- Simplified FIRST TIME PATH logic ---
+    interpreter_eat(interpreter, TOKEN_AWAIT);
+    ExprResult awaitable_expr_res = interpret_logical_or_expr(interpreter);
+
+    if (interpreter->exception_is_active) {
+        if (awaitable_expr_res.is_freshly_created_container) free_value_contents(awaitable_expr_res.value);
+        free_token(await_keyword_token);
+        return awaitable_expr_res;
+    }
+
+    if (awaitable_expr_res.value.type != VAL_COROUTINE && awaitable_expr_res.value.type != VAL_GATHER_TASK) {
+        if (awaitable_expr_res.is_freshly_created_container) free_value_contents(awaitable_expr_res.value);
+        report_error("Runtime", "Can only 'await' a coroutine or gather task.", await_keyword_token);
+    }
+
+    target_coro = awaitable_expr_res.value.as.coroutine_val;
+
+    if (target_coro == self_coro) {
+        if (awaitable_expr_res.is_freshly_created_container) free_value_contents(awaitable_expr_res.value);
+        report_error("Runtime", "A coroutine cannot await itself.", await_keyword_token);
+    }
+
+    // --- COMMON LOGIC (YIELD or GET RESULT) ---
+    if (target_coro->state == CORO_DONE) {
+        ExprResult final_result;
+        if (target_coro->has_exception) {
             interpreter->exception_is_active = 1;
             free_value_contents(interpreter->current_exception);
-            interpreter->current_exception.type = VAL_STRING;
-            interpreter->current_exception.as.string_val = strdup(CANCELLED_ERROR_MSG);
-            ExprResult cancelled_res;
-            cancelled_res.value = create_null_value();
-            cancelled_res.is_freshly_created_container = false;
-            cancelled_res.is_standalone_primary_id = false;
-            return cancelled_res;
-        }
-
-        // Suspend self_coro
-        self_coro->resume_state = get_lexer_state(interpreter->lexer); // Save current execution point
-        self_coro->state = CORO_SUSPENDED_AWAIT; // More specific state
-        self_coro->awaiting_on_coro = target_coro;
-        if (target_coro) { // If we are actually awaiting something
-            target_coro->ref_count++; // self_coro now holds a reference
-            DEBUG_PRINTF("AWAIT_SUSPEND: Coro %s (%p) incremented ref_count of target %s (%p) to %d", self_coro->name ? self_coro->name : "unnamed_s", (void*)self_coro, target_coro->name ? target_coro->name : "unnamed_t", (void*)target_coro, target_coro->ref_count);
-        }
-        coroutine_add_waiter(target_coro, self_coro); // self_coro is waiting on target_coro
-
-        interpreter->coroutine_yielded_for_await = 1; // Signal to event loop
-
-        // The VAL_COROUTINE from awaitable_expr_res is not freed here; its pointer is now in self_coro->awaiting_on_coro.
-        // The event loop will manage target_coro. If awaitable_expr_res was fresh, its Value struct will be freed by caller.
-
-            // When an await causes a yield, the expression effectively produces no value *at this moment*.
-            // The 'let' statement or other context will receive this. Upon resumption, the actual value
-            // from the awaited coroutine will be injected.
-            // The crucial part is that `interpret_await_expr` returns, and the lexer is positioned *after* the awaited expression.
-        ExprResult pending_res;
-        // Ensure current_token is advanced past the awaitable_expr if it hasn't been.
-        // This is a safeguard; interpret_logical_or_expr should handle this.
-        // If awaitable_expr_res.value.type was VAL_COROUTINE, it means interpret_logical_or_expr parsed it.
-        // The current_token should already be past it. This line is unlikely to be the true fix if parser logic is sound.
-        pending_res.value = create_null_value(); // Actual value will be injected on resume
-        pending_res.is_freshly_created_container = false;
-        pending_res.is_standalone_primary_id = false;
-        return pending_res;
-    }
-    return interpret_ternary_expr(interpreter); // Not an await, parse ternary (next lowest precedence)
-}
-
-static void coroutine_add_waiter(Coroutine* self, Coroutine* waiter_coro_to_add) {
-    CoroutineWaiterNode* new_node = malloc(sizeof(CoroutineWaiterNode));
-    if (!new_node) {
-        report_error("System", "Failed to allocate CoroutineWaiterNode.", NULL);
-    }
-    new_node->waiter_coro = waiter_coro_to_add;
-    new_node->next = self->waiters_head;
-    self->waiters_head = new_node;
-    DEBUG_PRINTF("COROUTINE_ADD_WAITER: Coro %s (%p) added as waiter to %s (%p)",
-                 waiter_coro_to_add->name ? waiter_coro_to_add->name : "unnamed_waiter", (void*)waiter_coro_to_add,
-                 self->name ? self->name : "unnamed_target", (void*)self);
-}
-
-Value interpret_dictionary_literal(Interpreter* interpreter) {
-    Token* lbrace_token = interpreter->current_token;
-    interpreter_eat(interpreter, TOKEN_LBRACE);
-    Dictionary* dict = dictionary_create(16, lbrace_token);
-    
-    if (interpreter->current_token->type != TOKEN_RBRACE) {
-        while (1) {
-            ExprResult key_res = interpret_expression(interpreter); // Key can be any expression
-            Value key = key_res.value;
-            if (key.type != VAL_STRING) {
-                free_value_contents(key);
-                report_error("Syntax", "Dictionary keys must be (or evaluate to) strings.", interpreter->current_token);
-            }
-            
-            interpreter_eat(interpreter, TOKEN_COLON);
-            ExprResult value_res = interpret_expression(interpreter);
-            Value value = value_res.value;
-            
-            dictionary_set(dict, key.as.string_val, value, interpreter->current_token);
-            free_value_contents(key); // key string was copied by dictionary_set
-            if (value_res.is_freshly_created_container) { // Only free if the value expression resulted in a new container
-                free_value_contents(value); // value was copied by dictionary_set
-            }
-            
-            if (interpreter->current_token->type == TOKEN_RBRACE) break;
-            interpreter_eat(interpreter, TOKEN_COMMA);
-        }
-    }
-    
-    interpreter_eat(interpreter, TOKEN_RBRACE);
-    Value val;
-    val.type = VAL_DICT;
-    val.as.dict_val = dict;
-    return val;
-}
-
-// Helper to parse arguments for any function/method call.
-// Assumes LPAREN was already consumed. Consumes tokens up to and including RPAREN.
-// Populates args_out, arg_count_out, arg_is_fresh_out.
-// Removed unused parameter warning for call_site_token_for_errors
-static void parse_call_arguments(Interpreter* interpreter, Value args_out[], int* arg_count_out, bool arg_is_fresh_out[], int max_args, Token* call_site_token_for_errors) {
-    *arg_count_out = 0;    
-    if (interpreter->current_token->type != TOKEN_RPAREN) {
-        do {
-            if (*arg_count_out >= max_args) {
-                report_error("Syntax", "Exceeded maximum number of function arguments (10).", interpreter->current_token);
-                (void)call_site_token_for_errors; // Mark as unused if error path doesn't use it
-            }
-            ExprResult arg_expr_res = interpret_expression(interpreter);
-            args_out[*arg_count_out] = arg_expr_res.value;
-            arg_is_fresh_out[*arg_count_out] = arg_expr_res.is_freshly_created_container;
-            (*arg_count_out)++;
-            if (interpreter->current_token->type == TOKEN_COMMA) {
-                interpreter_eat(interpreter, TOKEN_COMMA);
-            } else {
-                break;
-            }
-        } while (interpreter->current_token->type != TOKEN_RPAREN && interpreter->current_token->type != TOKEN_EOF);
-    }
-    interpreter_eat(interpreter, TOKEN_RPAREN);
-}
-
-Value interpret_any_function_call(Interpreter* interpreter, const char* func_name_str_or_null_for_bound, Token* func_name_token_for_error_reporting, Value* bound_method_val_or_null) {
-    // This function is called after the ID (func_name or method_name) has been processed
-    // and TOKEN_LPAREN is the current token. It will consume LPAREN, args, RPAREN.
-    interpreter_eat(interpreter, TOKEN_LPAREN); // Consume '('
-
-    Value args[10]; // Max 10 arguments
-    int arg_count = 0;
-    bool arg_is_fresh[10] = {false}; // Track freshness of arguments
-    // Parse arguments using the new helper
-    parse_call_arguments(interpreter, args, &arg_count, arg_is_fresh, 10, func_name_token_for_error_reporting);
-
-    Value result;
-
-    if (bound_method_val_or_null && bound_method_val_or_null->type == VAL_BOUND_METHOD) {
-        BoundMethod* bm = bound_method_val_or_null->as.bound_method_val;
-        if (bm->type == FUNC_TYPE_C_BUILTIN && bm->func_ptr.c_builtin == builtin_append) {
-            if (bm->self_value.type != VAL_ARRAY) {
-                for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-                report_error("Internal", "append method bound to non-array.", func_name_token_for_error_reporting);
-            }
-            // For C builtins, pass self as the first argument
-            Value final_args_for_c_builtin[11]; // self + max 10 args
-            final_args_for_c_builtin[0] = bm->self_value; // Array is self
-            for (int i = 0; i < arg_count; ++i) {
-                final_args_for_c_builtin[i+1] = args[i];
-            }
-            result = builtin_append(interpreter, final_args_for_c_builtin, arg_count + 1, func_name_token_for_error_reporting);
-            // Free parsed arguments if they were fresh (builtin_append doesn't consume them in a way execute_echoc_function does)
-            for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-            // bm->self_value (the array) is modified in-place. If bm->self_is_owned_copy,
-            // the VAL_BOUND_METHOD's free_value_contents will handle it.
-        } else if (bm->type == FUNC_TYPE_ECHOC) { // Regular EchoC method
-            Object* self_obj_ptr = NULL;
-            if (bm->self_value.type == VAL_OBJECT) {
-                self_obj_ptr = bm->self_value.as.object_val;
-            } else {
-                for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]); // Free args before error
-                report_error("Internal", "Bound method 'self' is not an object for a non-builtin method call.", func_name_token_for_error_reporting);
-            }
-            result = execute_echoc_function(interpreter, bm->func_ptr.echoc_function, self_obj_ptr, args, arg_is_fresh, arg_count, func_name_token_for_error_reporting);
-            // execute_echoc_function handles freeing args elements after copying them.
+            interpreter->current_exception = value_deep_copy(target_coro->exception_value);
+            final_result.value = create_null_value();
         } else {
-            report_error("Internal", "Unknown bound method type in call.", func_name_token_for_error_reporting);
+            final_result.value = value_deep_copy(target_coro->result_value);
         }
-    } else { // Regular function call (not bound method)
-        if (!func_name_str_or_null_for_bound) {
-            report_error("Internal", "Function name missing for non-bound call.", func_name_token_for_error_reporting);
+        // The awaitable was already completed. We've copied its result. We must now release the reference
+        // to the temporary awaitable coroutine object if it was freshly created.
+        if (awaitable_expr_res.is_freshly_created_container) {
+            free_value_contents(awaitable_expr_res.value);
         }
-        const char* func_name_str = func_name_str_or_null_for_bound;
+        final_result.is_freshly_created_container = true;
+        final_result.is_standalone_primary_id = false;
 
-        if (strcmp(func_name_str, "slice") == 0) {
-            result = builtin_slice(interpreter, args, arg_count, func_name_token_for_error_reporting);
-            // builtin_slice doesn't consume args, free them if fresh
-            for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-        } else if (strcmp(func_name_str, "async_sleep") == 0) {
-            result = builtin_async_sleep_create_coro(interpreter, args, arg_count, func_name_token_for_error_reporting);
-            // Args are consumed by the builtin, no need to free here.
-        } else if (strcmp(func_name_str, "gather") == 0) {
-            result = builtin_gather_create_coro(interpreter, args, arg_count, func_name_token_for_error_reporting);
-            // Args (the array of coroutines) are deep copied by gather, so free original if fresh.
-            for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-        } else if (strcmp(func_name_str, "cancel") == 0) {
-            result = builtin_cancel_coro(interpreter, args, arg_count, func_name_token_for_error_reporting);
-            for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-        } else { // Look for user-defined function
-            Value* func_val_ptr = symbol_table_get(interpreter->current_scope, func_name_str);
-            if (func_val_ptr && func_val_ptr->type == VAL_FUNCTION) {
-                Function* func_to_run = func_val_ptr->as.function_val;
-                if (func_to_run->is_async) {
-                    Coroutine* coro = malloc(sizeof(Coroutine));
-                    if (!coro) {
-                        for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-                        report_error("System", "Failed to allocate Coroutine object.", func_name_token_for_error_reporting);
-                    }
-                    coro->function_def = func_to_run;
-                    coro->ref_count = 1;
-                    // Initialize resume_state for the first run
-                    coro->resume_state = func_to_run->body_start_state; // Copy pos, line, col, etc.
-                    // Ensure resume_state's text pointers are for the function's owned copy
-                    coro->resume_state.text = func_to_run->source_text_owned_copy;
-                    coro->resume_state.text_length = func_to_run->source_text_length;
-                    DEBUG_PRINTF("CORO_CREATE (EchoC): Initialized ref_count for %s (%p) to 1", func_to_run->name, (void*)coro);
+        free_token(await_keyword_token);
+        self_coro->has_yielding_await_state = false; // We have successfully resumed and gotten the result.
+        return final_result;
+    }
 
-                    // Argument and scope setup
-                    Scope* old_interpreter_scope = interpreter->current_scope; // Save interpreter's current scope
-                    interpreter->current_scope = func_to_run->definition_scope; // Temporarily set to function's definition scope
-                    enter_scope(interpreter); // Create the coroutine's execution scope
-                    coro->execution_scope = interpreter->current_scope; // Assign the new scope to the coroutine
-
-                    int min_required_args = 0;
-                    for (int i = 0; i < func_to_run->param_count; ++i) {
-                        if (!func_to_run->params[i].default_value) min_required_args++;
-                    }
-                    if (arg_count < min_required_args || arg_count > func_to_run->param_count) {
-                        exit_scope(interpreter); // Clean up the entered scope
-                        interpreter->current_scope = old_interpreter_scope; // Restore interpreter's scope
-                        free(coro); // Free partially created coroutine
-                        for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-                        char err_msg[250];
-                        snprintf(err_msg, sizeof(err_msg), "Async function '%s' expects %d arguments (%d required), but %d were given.",
-                                 func_to_run->name, func_to_run->param_count, min_required_args, arg_count);
-                        report_error("Runtime", err_msg, func_name_token_for_error_reporting);
-                    }
-
-                    int current_arg_idx = 0;
-                    for (int i = 0; i < func_to_run->param_count; ++i) {
-                        if (current_arg_idx < arg_count) {
-                            symbol_table_set(coro->execution_scope, func_to_run->params[i].name, args[current_arg_idx]);
-                            current_arg_idx++;
-                        } else { // Use default value
-                            symbol_table_set(coro->execution_scope, func_to_run->params[i].name, *(func_to_run->params[i].default_value));
-                        }
-                    }
-                    interpreter->current_scope = old_interpreter_scope; // Restore interpreter's original scope
-                    // The `args` array elements (if fresh) will be freed by the outer logic of interpret_any_function_call
-                    // after this block, which is correct as symbol_table_set made deep copies.
-
-                    // Initialize coroutine fields
-                    coro->name = strdup(func_to_run->name);
-                    // coro->execution_scope is now set
-                    coro->state = CORO_NEW;
-                    coro->result_value = create_null_value();
-                    coro->exception_value = create_null_value();
-                    coro->has_exception = 0;
-                    coro->awaiting_on_coro = NULL;
-                    coro->value_from_await = create_null_value();
-                    coro->is_resumed_from_await = 0;
-                    coro->wakeup_time_sec = 0;
-                    coro->gather_tasks = NULL;
-                    coro->gather_results = NULL;
-                    coro->gather_pending_count = 0;
-                    coro->gather_first_exception_idx = -1;
-                    coro->parent_gather_coro = NULL;
-                    coro->is_cancelled = 0;
-                    coro->waiters_head = NULL;
-
-                    result.type = VAL_COROUTINE;
-                    result.as.coroutine_val = coro;
-                } else {
-                    result = execute_echoc_function(interpreter, func_to_run, NULL, args, arg_is_fresh, arg_count, func_name_token_for_error_reporting);
-                    // execute_echoc_function handles freeing args elements after copying them.
+    // --- YIELDING LOGIC ---
+    if (target_coro->state == CORO_NEW) {
+        if (target_coro->gather_tasks) { // It's a gather task
+            target_coro->state = CORO_GATHER_WAIT;
+            // When a gather task is first awaited, schedule all its children.
+            for (int i = 0; i < target_coro->gather_tasks->count; ++i) {
+                Coroutine* child_task = target_coro->gather_tasks->elements[i].as.coroutine_val;
+                if (child_task->parent_gather_coro == NULL) {
+                    child_task->parent_gather_coro = target_coro;
                 }
-            } else {
-                char err_msg[300];
-                snprintf(err_msg, sizeof(err_msg), "Undefined function '%s'", func_name_str);
-                for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-                report_error("Runtime", err_msg, func_name_token_for_error_reporting);
-                result = create_null_value(); // Should not be reached
-            }
-        }
-    }
-    return result;
-}
-
-Value interpret_instance_creation(Interpreter* interpreter, Blueprint* bp_to_instantiate, Token* call_site_token) {
-    // This function is called when TOKEN_LPAREN is the current token, after the blueprint ID.
-    interpreter_eat(interpreter, TOKEN_LPAREN); // Consume '(' before parsing arguments
-    // So, we directly parse arguments here.
-
-    Value args[10];
-    int arg_count = 0;
-    bool arg_is_fresh[10] = {false};
-    parse_call_arguments(interpreter, args, &arg_count, arg_is_fresh, 10, call_site_token);
-
-    Object* new_obj = malloc(sizeof(Object));
-    if (!new_obj) report_error("System", "Failed to allocate memory for new object.", call_site_token);
-    new_obj->blueprint = bp_to_instantiate;
-    new_obj->instance_attributes = malloc(sizeof(Scope));
-    if (!new_obj->instance_attributes) { free(new_obj); report_error("System", "Failed to allocate instance attributes scope.", call_site_token); }
-    new_obj->instance_attributes->symbols = NULL;
-    new_obj->instance_attributes->outer = NULL; // Instance scope is isolated
-
-    Value instance_val;
-    instance_val.type = VAL_OBJECT;
-    instance_val.as.object_val = new_obj;
-
-    // Call init method if it exists
-    Function* init_method = bp_to_instantiate->init_method_cache;
-    if (!init_method) { // Try to find it if not cached (e.g. first time)
-        Value* init_val_ptr = symbol_table_get_local(bp_to_instantiate->class_attributes_and_methods, "init");
-        if (init_val_ptr && init_val_ptr->type == VAL_FUNCTION) {
-            init_method = init_val_ptr->as.function_val;
-            bp_to_instantiate->init_method_cache = init_method; // Cache it
-        }
-    }
-
-    if (init_method) {
-        if (init_method->is_async) {
-            // If init is async, it creates a coroutine. This is unusual for constructors.
-            // EchoC's 'run:' or an internal mechanism would be needed to execute this async init.
-            // For now, we'll disallow async init or treat it as an error.
-            report_error("Runtime", "'init' method cannot be 'async'.", call_site_token);
-            // Free args if they were fresh
-            for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]);
-        } else {
-            Value init_result = execute_echoc_function(interpreter, init_method, new_obj, args, arg_is_fresh, arg_count, call_site_token);
-            // Result of init is usually ignored (like Python's __init__ returning None implicitly)
-            // but we must free it if it's not VAL_NULL or simple type.
-            // call_site_token is owned by the caller and should not be freed here.
-            if (init_result.type != VAL_NULL) {
-                // Could check if init is allowed to return non-null. For now, just free.
-                DEBUG_PRINTF("Init method for %s returned non-null. Discarding.", bp_to_instantiate->name);
-            }
-            free_value_contents(init_result);
-        }
-    } else {
-        // No explicit init. Check if any arguments were passed.
-        if (arg_count > 0) { // Arguments were parsed by parse_call_arguments
-            for(int i=0; i<arg_count; ++i) if(arg_is_fresh[i]) free_value_contents(args[i]); // Free unused args
-            report_error("Runtime", "Blueprint has no 'init' method but arguments were provided for instantiation.", call_site_token);
-        }
-        // RPAREN was already consumed by parse_call_arguments
-    }
-    return instance_val;
-}
-
-Value lookup_dot_attribute(Interpreter* interpreter, Value result, Token* dot_token, bool result_is_freshly_created) {
-    // Get the attribute name from the next token.
-    char* attr_name = strdup(interpreter->current_token->value);
-    interpreter_eat(interpreter, interpreter->current_token->type); // Consume attribute token
-
-    if (result.type == VAL_OBJECT) {
-        Object* obj = result.as.object_val;
-        if (strcmp(attr_name, "blueprint") == 0) {
-            // Special case: obj.blueprint returns the blueprint itself.
-            Value next;
-            next.type = VAL_BLUEPRINT;
-            next.as.blueprint_val = obj->blueprint;
-            free(attr_name);
-            free_token(dot_token);
-            return next;
-        } else {
-            // Look in instance attributes.
-            Value* attr_val_ptr = symbol_table_get_local(obj->instance_attributes, attr_name);
-            // If not found in instance, search the class attributes/methods.
-            if (!attr_val_ptr) {
-                Blueprint* current_bp = obj->blueprint;
-                while (current_bp) {
-                    attr_val_ptr = symbol_table_get_local(current_bp->class_attributes_and_methods, attr_name);
-                    if (attr_val_ptr) break;
-                    current_bp = current_bp->parent_blueprint;
+                if (child_task->state == CORO_NEW) {
+                    child_task->state = CORO_RUNNABLE;
+                    add_to_ready_queue(interpreter, child_task);
                 }
             }
-            if (!attr_val_ptr) {
-                char err_msg[150];
-                sprintf(err_msg, "Object of blueprint '%s' has no attribute or method '%s'.", obj->blueprint->name, attr_name);
-                free(attr_name);
-                if(result_is_freshly_created) free_value_contents(result);
-                report_error("Runtime", err_msg, dot_token);
-                free_token(dot_token);
-            }
-            // If the attribute is a function, return a bound method.
-            if (attr_val_ptr->type == VAL_FUNCTION) {
-                BoundMethod* bm = malloc(sizeof(BoundMethod));
-                if (!bm) {
-                    free(attr_name);
-                    free_token(dot_token);
-                    report_error("System", "Failed to allocate memory for bound method.", dot_token);
-                }
-                bm->type = FUNC_TYPE_ECHOC;
-                bm->func_ptr.echoc_function = attr_val_ptr->as.function_val;
-                bm->self_value.type = VAL_OBJECT;
-                bm->self_value.as.object_val = obj;
-                bm->self_is_owned_copy = result_is_freshly_created ? 1 : 0;
-                Value bound_method_val;
-                bound_method_val.type = VAL_BOUND_METHOD;
-                bound_method_val.as.bound_method_val = bm;
-                free(attr_name);
-                free_token(dot_token);
-                return bound_method_val;
-            } else { // Regular attribute: perform a deep copy.
-                Value next = value_deep_copy(*attr_val_ptr);
-                free(attr_name);
-                free_token(dot_token);
-                return next;
-            }
-        }
-    } else if (result.type == VAL_ARRAY) {
-        // New branch: when the left-hand side is an array.
-        if (strcmp(attr_name, "append") == 0) {
-            BoundMethod* bm = malloc(sizeof(BoundMethod));
-            if (!bm) {
-                free(attr_name);
-                free_token(dot_token);
-                report_error("System", "Failed to allocate memory for bound method.", dot_token);
-            }
-            bm->type = FUNC_TYPE_C_BUILTIN;
-            bm->func_ptr.c_builtin = builtin_append;
-            bm->self_value = result; // Bind the array value as self using the new field.
-            bm->self_is_owned_copy = 0;
-            Value bound_method_val;
-            bound_method_val.type = VAL_BOUND_METHOD;
-            bound_method_val.as.bound_method_val = bm;
-            free(attr_name);
-            free_token(dot_token);
-            return bound_method_val;
+        } else if (target_coro->name && strcmp(target_coro->name, "weaver.rest") == 0) {
+            // Special handling for weaver.rest: it goes directly to the sleep queue.
+            target_coro->state = CORO_SUSPENDED_TIMER;
+            add_to_sleep_queue(interpreter, target_coro);
+            DEBUG_PRINTF("AWAIT_EXPR: Timer coro %s (%p) put to sleep queue directly.", target_coro->name, (void*)target_coro);
         } else {
-            char err_msg[150];
-            sprintf(err_msg, "Type VAL_ARRAY has no attribute '%s'.", attr_name);
-            free(attr_name);
-            if(result_is_freshly_created) free_value_contents(result);
-            report_error("Runtime", err_msg, dot_token);
-            free_token(dot_token);
+            target_coro->state = CORO_RUNNABLE;
+            add_to_ready_queue(interpreter, target_coro);
         }
-    } else if (result.type == VAL_DICT) {
-        Dictionary* dict = result.as.dict_val;
-        Value val_from_dict;
-        if (dictionary_try_get(dict, attr_name, &val_from_dict, true)) {
-            free(attr_name);
-            free_token(dot_token);
-            return val_from_dict; // dictionary_try_get returns a deep copy
-        } else {
-            char err_msg[150];
-            sprintf(err_msg, "Key '%s' not found in dictionary.", attr_name);
-            free(attr_name);
-            if(result_is_freshly_created) free_value_contents(result);
-            report_error("Runtime", err_msg, dot_token);
-            free_token(dot_token);
-        }
-    } else if (result.type == VAL_SUPER_PROXY) {
-        Object* self_obj_for_super = interpreter->current_self_object;
-        if (!self_obj_for_super || !self_obj_for_super->blueprint->parent_blueprint) {
-            free(attr_name);
-            if(result_is_freshly_created) free_value_contents(result);
-            report_error("Runtime", "'super' used incorrectly or in a class with no parent.", dot_token);
-            free_token(dot_token);
-        }
-        Value* parent_method_ptr = symbol_table_get_local(self_obj_for_super->blueprint->parent_blueprint->class_attributes_and_methods, attr_name);
-        if (!parent_method_ptr || parent_method_ptr->type != VAL_FUNCTION) {
-            char err_msg[150];
-            sprintf(err_msg, "Parent blueprint of '%s' does not have method '%s' or it's not a function.", self_obj_for_super->blueprint->name, attr_name);
-            free(attr_name);
-            if(result_is_freshly_created) free_value_contents(result);
-            report_error("Runtime", err_msg, dot_token);
-            free_token(dot_token);
-        }
-        BoundMethod* bm = malloc(sizeof(BoundMethod));
-        if (!bm) {
-            free(attr_name);
-            free_token(dot_token);
-            report_error("System", "Failed to allocate memory for bound method.", dot_token);
-        }
-        bm->type = FUNC_TYPE_ECHOC;
-        bm->func_ptr.echoc_function = parent_method_ptr->as.function_val;
-        bm->self_value.type = VAL_OBJECT; // Assign type
-        bm->self_value.as.object_val = self_obj_for_super;
-        bm->self_is_owned_copy = 0;
-        Value bound_method_val;
-        bound_method_val.type = VAL_BOUND_METHOD;
-        bound_method_val.as.bound_method_val = bm;
-        free(attr_name);
-        free_token(dot_token);
-        return bound_method_val;
-    } else {
-        char err_msg[100];
-        sprintf(err_msg, "Cannot access attribute '%s' on non-object/blueprint/super_proxy type (got type %d).", attr_name, result.type);
-        free(attr_name);
-        if(result_is_freshly_created) free_value_contents(result);
-        report_error("Runtime", err_msg, dot_token);
-        free_token(dot_token);
     }
-    return create_null_value();
+
+    self_coro->state = CORO_SUSPENDED_AWAIT;
+    self_coro->awaiting_on_coro = target_coro;
+    coroutine_incref(target_coro);
+    // --- START: Set precise resume state ---
+    // Before overwriting the yielding_await_token, free the old one if it exists. This prevents a leak
+    // if a new await is encountered during a resume cycle before the original await point is reached.
+    if (self_coro->yielding_await_token) {
+        free_token(self_coro->yielding_await_token);
+    }
+    self_coro->has_yielding_await_state = true;
+    self_coro->yielding_await_state = get_lexer_state_for_token_start(interpreter->lexer, await_keyword_token->line, await_keyword_token->col, await_keyword_token);
+    // Store the yielding token itself for the resume check. Transfer ownership of await_keyword_token.
+    self_coro->yielding_await_token = await_keyword_token;
+    // --- END: Set precise resume state ---
+
+    // The references to the target_coro have now been transferred to the async machinery
+    // (the ready queue and the awaiting_on_coro pointer). We can now release the temporary
+    // reference held by the `awaitable_expr_res` if it was freshly created.
+    if (awaitable_expr_res.is_freshly_created_container) {
+        free_value_contents(awaitable_expr_res.value); // This will now just decref, not free.
+    }
+
+    coroutine_add_waiter(target_coro, self_coro);
+    ExprResult pending_res = { .value = create_null_value() };
+    return pending_res;
 }

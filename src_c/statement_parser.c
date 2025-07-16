@@ -11,41 +11,41 @@
 #include <string.h> // For strdup, strcmp
 #include <stdlib.h> // For free
 #include <math.h>   // For fmod in for loop
+#include "interpreter.h" // For Coroutine struct and other interpreter specifics if needed by interpret_coroutine_body
 
 // Forward declarations for static functions within this file
-static void interpret_show_statement(Interpreter* interpreter);
-static void interpret_let_statement(Interpreter* interpreter);
-static void interpret_if_statement(Interpreter* interpreter);
-static void interpret_block_statement(Interpreter* interpreter);
-static void skip_statements_in_branch(Interpreter* interpreter);
-static void interpret_loop_statement(Interpreter* interpreter); // Keep this
-static void interpret_while_loop(Interpreter* interpreter, int loop_col, int loop_line); // Pass loop_line
-static void interpret_for_loop(Interpreter* interpreter, int loop_col, int loop_line);
+static StatementExecStatus interpret_let_statement(Interpreter* interpreter);
+static StatementExecStatus interpret_if_statement(Interpreter* interpreter);
+static void skip_statements_in_branch(Interpreter* interpreter, int start_col);
+static StatementExecStatus interpret_loop_statement(Interpreter* interpreter);
+static StatementExecStatus interpret_for_loop(Interpreter* interpreter, int loop_col, int loop_line, Token* loop_keyword_token_for_context);
 static void interpret_funct_statement(Interpreter* interpreter, int statement_start_col, bool is_async_param);
+static void interpret_skip_statement(Interpreter* interpreter);
 static void interpret_break_statement(Interpreter* interpreter);
+static bool is_builtin_module(const char* module_name);
 static void interpret_continue_statement(Interpreter* interpreter);
-static void interpret_return_statement(Interpreter* interpreter);
-static void interpret_expression_statement(Interpreter* interpreter); // Added for function call statements
+static StatementExecStatus interpret_return_statement(Interpreter* interpreter); // Kept as StatementExecStatus
+static StatementExecStatus interpret_expression_statement(Interpreter* interpreter); // Changed to StatementExecStatus
 static void interpret_raise_statement(Interpreter* interpreter); // New
-static void interpret_try_statement(Interpreter* interpreter);   // New
-static void execute_statements_in_controlled_block(Interpreter* interpreter, int expected_indent_col, const char* block_type_for_error, TokenType terminator1, TokenType terminator2, TokenType terminator3);
-static void execute_loop_body_iteration(Interpreter* interpreter, int loop_start_col, int expected_body_indent_col, const char* loop_type_for_error);
-static void interpret_load_statement(Interpreter* interpreter); // For module loading
-static void interpret_blueprint_statement(Interpreter* interpreter); // For OOP
-static void interpret_run_statement(Interpreter* interpreter); // Forward declaration
+static void skip_all_elif_and_else_branches(Interpreter* interpreter, int if_col); // New forward declaration
+static StatementExecStatus interpret_try_statement(Interpreter* interpreter);   // MODIFIED: Return a status
+static void interpret_load_statement(Interpreter* interpreter);
+static void interpret_blueprint_statement(Interpreter* interpreter);
 
-// Modified execute_statements_in_branch to use the more generic execute_statements_in_controlled_block
-extern void add_to_ready_queue(Interpreter* interpreter, Coroutine* coro); // From interpreter.c or async_manager.c
-extern void run_event_loop(Interpreter* interpreter); // From interpreter.c or async_manager.c
-static void execute_statements_in_branch(Interpreter* interpreter, int expected_indent_col, const char* branch_type_for_error) {
-    execute_statements_in_controlled_block(interpreter, expected_indent_col, branch_type_for_error, TOKEN_ELIF, TOKEN_ELSE, TOKEN_END);
-}
+static StatementExecStatus interpret_block_statement(Interpreter* interpreter);
+static StatementExecStatus execute_statements_in_controlled_block(Interpreter* interpreter, int start_col, const char* block_type_for_error, TokenType terminator1, TokenType terminator2, TokenType terminator3);
+static StatementExecStatus execute_loop_body_iteration(Interpreter* interpreter, int loop_start_col, int expected_body_indent_col, const char* loop_type_for_error);
 
+extern void add_to_ready_queue(Interpreter* interpreter, Coroutine* coro); 
+extern void run_event_loop(Interpreter* interpreter); 
+// Forward declaration for a function from dictionary.c that is not in the header yet.
+extern Value* dictionary_try_get_value_ptr(Dictionary* dict, const char* key_str);
 StatementExecStatus interpret_statement(Interpreter* interpreter) {
     DEBUG_PRINTF("INTERPRET_STATEMENT: Token type: %s, value: '%s'. Current scope: %p",
                  token_type_to_string(interpreter->current_token->type), //
                  interpreter->current_token->value ? interpreter->current_token->value : "N/A", //
                  (void*)interpreter->current_scope); //
+
     // Skip extra COLON tokens if they occur between statements.
     // Skip if in event loop but no current coroutine and queue is empty (event loop should handle this)
     if (interpreter->async_event_loop_active && !interpreter->current_executing_coroutine && interpreter->async_ready_queue_head == NULL) return STATEMENT_EXECUTED_OK;
@@ -59,15 +59,7 @@ StatementExecStatus interpret_statement(Interpreter* interpreter) {
     }
 
     StatementExecStatus status = STATEMENT_EXECUTED_OK;
-    // Now process the statement.
-    if (interpreter->current_token->type == TOKEN_SHOW) {
-        interpret_show_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_RUN) {
-        interpret_run_statement(interpreter);
-    } else if (interpreter->current_token->type == TOKEN_LET) {
-        interpret_let_statement(interpreter); // This already eats its trailing colon
-        return status; // Let statement handles its own trailing colon
-    } else if (interpreter->current_token->type == TOKEN_ASYNC) { 
+    if (interpreter->current_token->type == TOKEN_ASYNC) { 
         Token* async_token_ref = interpreter->current_token;
         int start_col_for_async_funct = async_token_ref->col;
         interpreter_eat(interpreter, TOKEN_ASYNC);
@@ -76,47 +68,66 @@ StatementExecStatus interpret_statement(Interpreter* interpreter) {
     } else if (interpreter->current_token->type == TOKEN_FUNCT) {
         interpret_funct_statement(interpreter, interpreter->current_token->col, false);
     } else if (interpreter->current_token->type == TOKEN_RETURN) {
-        interpret_return_statement(interpreter);
+        status = interpret_return_statement(interpreter);
+    } else if (interpreter->current_token->type == TOKEN_LET) {
+        if ((status = interpret_let_statement(interpreter)) == STATEMENT_YIELDED_AWAIT) {
+            return status;
+        }
     } else if (interpreter->current_token->type == TOKEN_IF) {
-        interpret_if_statement(interpreter);
+        status = interpret_if_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_LOOP) {
-        interpret_loop_statement(interpreter);
+        status = interpret_loop_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_BREAK) {
         interpret_break_statement(interpreter);
+    } else if (interpreter->current_token->type == TOKEN_SKIP) {
+        interpret_skip_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_CONTINUE) {
         interpret_continue_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_LBRACE) {
-        interpret_block_statement(interpreter);
+        status = interpret_block_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_RAISE) {
-        if (!interpreter->in_try_catch_finally_block_definition) {
-            report_error("Syntax", "'raise:' statement can only be used lexically inside a 'try', 'catch', or 'finally' block.", interpreter->current_token);
-        }
         interpret_raise_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_TRY) {
-        interpret_try_statement(interpreter);
+        status = interpret_try_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_BLUEPRINT) {
         interpret_blueprint_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_LOAD) {
         interpret_load_statement(interpreter);
     } else if (interpreter->current_token->type == TOKEN_ID ||
-               interpreter->current_token->type == TOKEN_SUPER) { // Allow 'super' to start an expression statement
-        interpret_expression_statement(interpreter); // This already eats its trailing colon
-        return status; // Expression statement handles its own trailing colon
+               interpreter->current_token->type == TOKEN_SUPER ||
+               interpreter->current_token->type == TOKEN_AWAIT) {
+        status = interpret_expression_statement(interpreter);
+        return status;
     } else if (interpreter->current_token->type == TOKEN_EOF) {
         return status; // End of file, do nothing
+    } else if (interpreter->current_token->type == TOKEN_ELIF) {
+		// --- START: ADD THIS TEMPORARY DEBUG BLOCK ---
+		DEBUG_PRINTF("ELIF_ERROR_DEBUG: Encountered ELIF outside of an if-statement context.%s", "");
+		DEBUG_PRINTF("  Current Coroutine: %s (%p), State: %d",
+					 interpreter->current_executing_coroutine ? (interpreter->current_executing_coroutine->name ? interpreter->current_executing_coroutine->name : "unnamed") : "None",
+					 (void*)interpreter->current_executing_coroutine,
+					 interpreter->current_executing_coroutine ? interpreter->current_executing_coroutine->state : (CoroutineState)-1);
+		DEBUG_PRINTF("  Current Scope: %p (ID: %llu), Outer: %p",
+					 (void*)interpreter->current_scope,
+					 interpreter->current_scope ? interpreter->current_scope->id : (uint64_t)-1,
+					 interpreter->current_scope ? (void*)interpreter->current_scope->outer : NULL);
+		DEBUG_PRINTF("  Function Nesting Level: %d, Loop Depth: %d, Try/Catch Stack Top: %p", interpreter->function_nesting_level, interpreter->loop_depth, (void*)interpreter->try_catch_stack_top);
+		// --- END: ADD THIS TEMPORARY DEBUG BLOCK ---
+        report_error("Syntax", "'elif:' without a preceding 'if:' or 'elif:'.", interpreter->current_token);
+    } else if (interpreter->current_token->type == TOKEN_ELSE) {
+        report_error("Syntax", "'else:' without a preceding 'if:'.", interpreter->current_token);
     } else {
-        report_error_unexpected_token(interpreter, "a statement keyword (show, let, assign, funct, return, if, loop, etc.), an identifier (for a function call), or an opening brace '{'");
+        report_error_unexpected_token(interpreter, "a statement keyword, an identifier (for a function call), 'await', or an opening brace '{'");
     }
 
-    if (interpreter->coroutine_yielded_for_await) {
-        status = STATEMENT_YIELDED_AWAIT;
-    } else if (interpreter->break_flag || interpreter->continue_flag || interpreter->return_flag || interpreter->exception_is_active) {
-        status = STATEMENT_PROPAGATE_FLAG;
+    if (interpreter->break_flag || interpreter->continue_flag || interpreter->return_flag || interpreter->exception_is_active) {
+        if (status == STATEMENT_EXECUTED_OK) status = STATEMENT_PROPAGATE_FLAG;
     }
+
     return status;
 }
 
-static void interpret_expression_statement(Interpreter* interpreter) {
+static StatementExecStatus interpret_expression_statement(Interpreter* interpreter) {
     DEBUG_PRINTF("INTERPRET_EXPRESSION_STATEMENT: Token type: %s, value: '%s'",
                  token_type_to_string(interpreter->current_token->type),
                  interpreter->current_token->value ? interpreter->current_token->value : "N/A");
@@ -128,66 +139,72 @@ static void interpret_expression_statement(Interpreter* interpreter) {
     // The expression parser will handle parsing the function call.    
     // Changed from interpret_ternary_expr to interpret_expression
     ExprResult expr_res = interpret_expression(interpreter);
-    if (first_token_in_expr->type == TOKEN_ID && expr_res.is_standalone_primary_id) {
-        // An identifier was parsed, but no operations (call, access, arithmetic etc.) were applied to it.
-        // This is not a valid statement on its own.
-        free_value_contents(expr_res.value); // Free the value of the standalone ID
-        report_error("Syntax", "An identifier by itself is not a valid statement. Must be a function/method call or part of an assignment.", first_token_in_expr);
-    }
-    free_token(first_token_in_expr);
 
     Value result = expr_res.value;
 
     if (interpreter->exception_is_active) { // If expression evaluation raised an exception
         // If fresh, free it. If not, it's owned elsewhere.
         if (expr_res.is_freshly_created_container) free_value_contents(result);
-        return;
+        free_token(first_token_in_expr);
+        return STATEMENT_PROPAGATE_FLAG; // Propagate exception
     }
 
+    // If not resuming, and the result of a standalone expression statement is a coroutine,
+    // print its representation. This avoids re-printing during a resume.
+    if ((!interpreter->current_executing_coroutine || interpreter->current_executing_coroutine->state != CORO_RESUMING) &&
+        (result.type == VAL_COROUTINE || result.type == VAL_GATHER_TASK))
+    {
+        char* str_repr = value_to_string_representation(result, interpreter, first_token_in_expr);
+        debug_aware_printf("%s\n", str_repr);
+        fflush(stdout); // Ensure it prints before any potential warning on stderr
+        #ifdef DEBUG_ECHOC
+        if (echoc_debug_log_file) {
+            fflush(echoc_debug_log_file);
+        }
+        #endif
+        free(str_repr);
+    }
+
+    DEBUG_PRINTF("      INTERPRET_STATEMENT (near show): Coro: %p, IsActive: %d, Scope: %p, Scope Head: %s",
+            (void*)interpreter->current_executing_coroutine, interpreter->exception_is_active,
+            (void*)interpreter->current_scope, interpreter->current_scope->symbols ? interpreter->current_scope->symbols->name : "NULL");
+        
+        print_scope_contents(interpreter->current_scope);
+            
     // The result of an expression statement is discarded.
-    if (expr_res.is_freshly_created_container) { // Only free if it was a fresh container
+    if (expr_res.is_freshly_created_container && !(interpreter->exception_is_active)) {
         free_value_contents(result);
     }
 
-    // interpret_expression_statement's interpret_ternary_expr might leave current_token on COLON
-    if (interpreter->current_token->type == TOKEN_COLON) {
-        interpreter_eat(interpreter, TOKEN_COLON);
-    }
-}
+    free_token(first_token_in_expr);
 
-static void interpret_show_statement(Interpreter* interpreter) {
-    interpreter_eat(interpreter, TOKEN_SHOW);
+    // An expression statement must be terminated by a colon.
     interpreter_eat(interpreter, TOKEN_COLON);
-    ExprResult expr_res = interpret_expression(interpreter);
-    // Changed from interpret_ternary_expr to interpret_expression
-    Value result = expr_res.value;
-
-    if (interpreter->exception_is_active) {
-        free_value_contents(result);
-        return;
+    if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+        return STATEMENT_YIELDED_AWAIT;
     }
-    
-    char* str_repr = value_to_string_representation(result, interpreter, interpreter->current_token);
-    printf("%s\n", str_repr);
-    free(str_repr);
-    if (expr_res.is_freshly_created_container) { // Only free if it was a fresh container
-        free_value_contents(result);
-    }
-
-    interpreter_eat(interpreter, TOKEN_COLON);
+    return STATEMENT_EXECUTED_OK;
 }
-
 // Helper function to perform the actual indexed assignment
 // target_container: The direct container (array or dict) to modify
 // final_index: The index/key to use on target_container
-// value_to_set: The value to assign
+// value_to_set: The value to assign (this function will deep_copy it if needed)
 // error_token: For error reporting context
 // base_var_name: Name of the original variable for error messages
-static void perform_indexed_assignment(Value* target_container, Value final_index, Value value_to_set, Token* error_token, const char* base_var_name) {
+void perform_indexed_assignment(Value* target_container, Value final_index, Value value_to_set, Token* error_token, const char* base_var_name) {
+    if (g_interpreter_for_error_reporting->prevent_side_effects) return; // Do not perform assignment during a fast-forward resume
+
     if (target_container->type == VAL_ARRAY) {
         if (final_index.type != VAL_INT) {
+            g_interpreter_for_error_reporting->exception_is_active = 1;
+            free_value_contents(g_interpreter_for_error_reporting->current_exception);
+            g_interpreter_for_error_reporting->current_exception.type = VAL_STRING;
+            g_interpreter_for_error_reporting->current_exception.as.string_val = strdup("Array index for assignment must be an integer.");
+            if (g_interpreter_for_error_reporting->error_token) free_token(g_interpreter_for_error_reporting->error_token);
+            g_interpreter_for_error_reporting->error_token = token_deep_copy(error_token);
+            // Cleanup values that were passed in and would normally be freed by caller if no error
             free_value_contents(final_index); free_value_contents(value_to_set);
-            report_error("Runtime", "Array index for assignment must be an integer.", error_token);
+            return;
         }
         Array* arr = target_container->as.array_val;
         long idx = final_index.as.integer;
@@ -196,206 +213,466 @@ static void perform_indexed_assignment(Value* target_container, Value final_inde
 
         if (effective_idx < 0 || effective_idx >= arr->count) {
             char err_msg[150];
-            sprintf(err_msg, "Array assignment index %ld out of bounds for array '%s' (size %d).", idx, base_var_name, arr->count);
+            snprintf(err_msg, sizeof(err_msg), "Array assignment index %ld out of bounds for array '%s' (size %d).", idx, base_var_name, arr->count);
+            g_interpreter_for_error_reporting->exception_is_active = 1;
+            free_value_contents(g_interpreter_for_error_reporting->current_exception);
+            g_interpreter_for_error_reporting->current_exception.type = VAL_STRING;
+            g_interpreter_for_error_reporting->current_exception.as.string_val = strdup(err_msg);
+            if (g_interpreter_for_error_reporting->error_token) free_token(g_interpreter_for_error_reporting->error_token);
+            g_interpreter_for_error_reporting->error_token = token_deep_copy(error_token);
+            // Cleanup values that were passed in and would normally be freed by caller if no error
             free_value_contents(final_index); free_value_contents(value_to_set);
-            report_error("Runtime", err_msg, error_token);
+            return;
         }
         free_value_contents(arr->elements[effective_idx]); // Free old element
         arr->elements[effective_idx] = value_deep_copy(value_to_set);
     } else if (target_container->type == VAL_DICT) {
         if (final_index.type != VAL_STRING) {
+            g_interpreter_for_error_reporting->exception_is_active = 1;
+            free_value_contents(g_interpreter_for_error_reporting->current_exception);
+            g_interpreter_for_error_reporting->current_exception.type = VAL_STRING;
+            g_interpreter_for_error_reporting->current_exception.as.string_val = strdup("Dictionary key for assignment must be a string.");
+            if (g_interpreter_for_error_reporting->error_token) free_token(g_interpreter_for_error_reporting->error_token);
+            g_interpreter_for_error_reporting->error_token = token_deep_copy(error_token);
             free_value_contents(final_index); free_value_contents(value_to_set);
-            report_error("Runtime", "Dictionary key for assignment must be a string.", error_token);
+            return;
         }
         dictionary_set(target_container->as.dict_val, final_index.as.string_val, value_to_set, error_token);
     } else if (target_container->type == VAL_TUPLE) {
+        g_interpreter_for_error_reporting->exception_is_active = 1;
+        free_value_contents(g_interpreter_for_error_reporting->current_exception);
+        g_interpreter_for_error_reporting->current_exception.type = VAL_STRING;
+        g_interpreter_for_error_reporting->current_exception.as.string_val = strdup("Tuples are immutable and cannot be modified.");
+        if (g_interpreter_for_error_reporting->error_token) free_token(g_interpreter_for_error_reporting->error_token);
+        g_interpreter_for_error_reporting->error_token = token_deep_copy(error_token);
         free_value_contents(final_index); free_value_contents(value_to_set);
-        report_error("Runtime", "Tuples are immutable and cannot be modified.", error_token);
+        return;
     } else {
         char err_msg[150];
-        sprintf(err_msg, "Cannot apply indexed assignment to variable '%s' of type %d.", base_var_name, target_container->type);
+        snprintf(err_msg, sizeof(err_msg), "Cannot apply indexed assignment to variable '%s' of type %d.", base_var_name, target_container->type);
+        g_interpreter_for_error_reporting->exception_is_active = 1;
+        free_value_contents(g_interpreter_for_error_reporting->current_exception);
+        g_interpreter_for_error_reporting->current_exception.type = VAL_STRING;
+        g_interpreter_for_error_reporting->current_exception.as.string_val = strdup(err_msg);
+        if (g_interpreter_for_error_reporting->error_token) free_token(g_interpreter_for_error_reporting->error_token);
+        g_interpreter_for_error_reporting->error_token = token_deep_copy(error_token);
         free_value_contents(final_index); free_value_contents(value_to_set);
-        report_error("Runtime", err_msg, error_token);
+        return;
     }
     free_value_contents(final_index); // final_index is consumed
     // value_to_set is consumed by deep_copy or dictionary_set which makes its own copy
 }
 
-static void interpret_let_statement(Interpreter* interpreter) {
+static StatementExecStatus interpret_let_statement(Interpreter* interpreter) {
+    DEBUG_PRINTF("INTERPRET_LET_STMT: Entering. Current token: %s ('%s')",
+                 token_type_to_string(interpreter->current_token->type),
+                 interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+    fflush(stderr); // Ensure this prints immediately
+    StatementExecStatus status = STATEMENT_EXECUTED_OK;
     interpreter_eat(interpreter, TOKEN_LET);
     interpreter_eat(interpreter, TOKEN_COLON); // Colon after 'let'
-
-    Token* var_name_token = interpreter->current_token;
-    if (var_name_token->type != TOKEN_ID) {
-        report_error("Syntax", "Expected variable name after 'let:'", var_name_token);
+    
+    // Deep copy the token that represents the variable/attribute being assigned to.
+    // This copy will be used for error reporting if needed later in the statement,
+    // as the original token might be consumed by interpreter_eat.
+    Token* target_name_token_for_error = token_deep_copy(interpreter->current_token);
+    if (target_name_token_for_error->type != TOKEN_ID) {
+        // If target_name_token_for_error itself is not an ID, it's an immediate syntax error.
+        // No var_name_str would have been allocated yet.
+        report_error("Syntax", "Expected variable name after 'let:'", target_name_token_for_error);
+        free_token(target_name_token_for_error); // Free the copy before exiting
     }
-    char* var_name_str = strdup(var_name_token->value);
+    char* var_name_str = strdup(target_name_token_for_error->value);
     interpreter_eat(interpreter, TOKEN_ID);
 
+    DEBUG_PRINTF("LET_STMT: Variable name: '%s'. Current token before assignment part: %s ('%s')",
+                 var_name_str,
+                 token_type_to_string(interpreter->current_token->type),
+                 interpreter->current_token->value ? interpreter->current_token->value : "N/A");
     // Handle 'let: self.attribute = value'
     if (strcmp(var_name_str, "self") == 0 && interpreter->current_token->type == TOKEN_DOT) { // Starts with self.
         if (!interpreter->current_self_object) {
-            free(var_name_str);
-            report_error("Runtime", "'self' can only be used within an instance method.", var_name_token);
+            free(var_name_str); free_token(target_name_token_for_error);
+            report_error("Runtime", "'self' can only be used within an instance method.", target_name_token_for_error); 
         }
         interpreter_eat(interpreter, TOKEN_DOT); // Eat '.'
         Token* attr_name_token = interpreter->current_token;
         if (attr_name_token->type != TOKEN_ID) {
-            free(var_name_str);
+            // attr_name_str not yet allocated
+            free(var_name_str); free_token(target_name_token_for_error);
             report_error("Syntax", "Expected attribute name after 'self.'.", attr_name_token);
-        }
+        } // attr_name_token is consumed by strdup or eat
         char* attr_name_str = strdup(attr_name_token->value);
         interpreter_eat(interpreter, TOKEN_ID); // Eat attribute name
 
+        DEBUG_PRINTF("LET_STMT (self): Attribute name: '%s'. Current token: %s ('%s')",
+                     attr_name_str,
+                     token_type_to_string(interpreter->current_token->type),
+                     interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+
         if (interpreter->current_token->type == TOKEN_LBRACKET) { // self.attribute[index] = value
             Object* self_obj = interpreter->current_self_object;
-            Value* container_val_ptr = symbol_table_get_local(self_obj->instance_attributes, attr_name_str);
-            if (!container_val_ptr) {
+            Value* base_container_val_ptr = symbol_table_get_local(self_obj->instance_attributes, attr_name_str);
+            if (!base_container_val_ptr) {
                 // Could also check blueprint attributes if self.CLASS_ATTR[idx] was allowed (not currently supported this way)
-                char err_msg[200]; sprintf(err_msg, "Attribute '%s' not found on 'self' for indexed assignment.", attr_name_str);
-                free(var_name_str); free(attr_name_str); report_error("Runtime", err_msg, attr_name_token);
+                char err_msg[200]; sprintf(err_msg, "Attribute '%s' not found on 'self' for indexed assignment.", attr_name_str); 
+                free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error); 
+                report_error("Runtime", err_msg, target_name_token_for_error); // Use target_name_token_for_error as attr_name_token might be invalid
             }
 
-            Value final_index_val;
-            interpreter_eat(interpreter, TOKEN_LBRACKET);
-            ExprResult index_res = interpret_expression(interpreter);
-            // Changed from interpret_ternary_expr to interpret_expression
-            final_index_val = index_res.value; // This is an R-value, needs freeing if complex
-            interpreter_eat(interpreter, TOKEN_RBRACKET);
+            Value* container_to_modify = base_container_val_ptr;
+            Value* parent_container_for_final_assignment = NULL;
+
+            Value final_index_for_assignment;
+            bool final_index_is_fresh = false;
+
+            while (interpreter->current_token->type == TOKEN_LBRACKET) {
+                parent_container_for_final_assignment = container_to_modify;
+
+                interpreter_eat(interpreter, TOKEN_LBRACKET);
+                ExprResult index_res = interpret_expression(interpreter);
+                Value current_loop_index = index_res.value;
+                bool current_loop_index_is_fresh = index_res.is_freshly_created_container;
+
+                if (interpreter->exception_is_active) {
+                    if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                    free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                    return STATEMENT_PROPAGATE_FLAG;
+                } 
+                if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                    if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                    free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                    return STATEMENT_YIELDED_AWAIT;
+                }
+                interpreter_eat(interpreter, TOKEN_RBRACKET);
+
+                if (final_index_is_fresh) free_value_contents(final_index_for_assignment); // Free previous loop's final_index if it was fresh
+                final_index_for_assignment = current_loop_index; // This becomes the final index if loop breaks
+                final_index_is_fresh = current_loop_index_is_fresh;
+
+                if (interpreter->current_token->type == TOKEN_ASSIGN) {
+                    break; // End of LHS
+                }
+
+                // Descend
+                if (parent_container_for_final_assignment->type == VAL_ARRAY) {
+                    if (current_loop_index.type != VAL_INT) {
+                        if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                        free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                        report_error("Runtime", "Array index must be an integer.", target_name_token_for_error);
+                    }
+                    long idx = current_loop_index.as.integer;
+                    long effective_idx = idx >= 0 ? idx : parent_container_for_final_assignment->as.array_val->count + idx;
+
+                    if (effective_idx < 0 || effective_idx >= parent_container_for_final_assignment->as.array_val->count) {
+                        char err_msg[150];
+                        sprintf(err_msg, "Array index %ld out of bounds for array attribute '%s' (size %d).", idx, attr_name_str, parent_container_for_final_assignment->as.array_val->count);
+                        if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                        free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                        report_error("Runtime", err_msg, target_name_token_for_error);
+                    }
+                    container_to_modify = &parent_container_for_final_assignment->as.array_val->elements[effective_idx];
+                    if (current_loop_index_is_fresh) free_value_contents(current_loop_index); // Traversal index freed
+                    final_index_is_fresh = false; // Mark as consumed for next iteration or if loop ends
+                } else if (parent_container_for_final_assignment->type == VAL_DICT) {
+                    if (current_loop_index.type != VAL_STRING) {
+                        if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                        free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                        report_error("Runtime", "Dictionary key must be a string.", target_name_token_for_error);
+                    }
+                    
+                    Value* next_container_ptr = dictionary_try_get_value_ptr(parent_container_for_final_assignment->as.dict_val, current_loop_index.as.string_val);
+                    if (!next_container_ptr) {
+                        char err_msg[200];
+                        sprintf(err_msg, "Key '%s' not found in dictionary attribute '%s' during chained assignment.", current_loop_index.as.string_val, attr_name_str);
+                        if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                        free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                        report_error("Runtime", err_msg, target_name_token_for_error);
+                    }
+                    container_to_modify = next_container_ptr; // This is a pointer to the Value inside the dictionary.
+                    if (current_loop_index_is_fresh) free_value_contents(current_loop_index); // Traversal index freed
+                    final_index_is_fresh = false; // Mark as consumed
+                } else {
+                    // This is the new final else block for all other unsupported types.
+                    if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                    free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                    report_error("Runtime", "Chained indexed assignment is only supported for nested arrays and dictionaries.", target_name_token_for_error);
+                }
+            }
 
             interpreter_eat(interpreter, TOKEN_ASSIGN);
+            DEBUG_PRINTF("LET_STMT (self.attr[...]): About to parse RHS. Current token: %s ('%s')",
+                         token_type_to_string(interpreter->current_token->type),
+                         interpreter->current_token->value ? interpreter->current_token->value : "N/A");
             ExprResult rhs_res = interpret_expression(interpreter);
-            // Changed from interpret_ternary_expr to interpret_expression
             Value val_to_set = rhs_res.value;
-            if (interpreter->exception_is_active) { free(var_name_str); free(attr_name_str); free_value_contents(final_index_val); free_value_contents(val_to_set); return; }
-
-            perform_indexed_assignment(container_val_ptr, final_index_val, val_to_set, attr_name_token, attr_name_str);
-            // perform_indexed_assignment frees final_index_val.
-            // val_to_set is deep_copied by perform_indexed_assignment. If rhs_res.is_freshly_created_container, free it.
-            if (rhs_res.is_freshly_created_container) free_value_contents(val_to_set);
             
+            if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                DEBUG_PRINTF("LET_STMT (self.attr[...]): RHS yielded. var_name='%s', attr_name='%s'. Pending.", var_name_str, attr_name_str);
+                status = STATEMENT_YIELDED_AWAIT;
+                if(final_index_is_fresh) free_value_contents(final_index_for_assignment);
+                if(rhs_res.is_freshly_created_container) free_value_contents(val_to_set); // RHS value will be re-evaluated
+                free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                return status;
+            }
+            if (interpreter->exception_is_active) {
+                if(final_index_is_fresh) free_value_contents(final_index_for_assignment);
+                if(rhs_res.is_freshly_created_container) free_value_contents(val_to_set);
+                free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                return STATEMENT_PROPAGATE_FLAG;
+            }
+
+            if (interpreter->is_dummy_resume_value) {
+                interpreter->is_dummy_resume_value = false; // Consume flag
+                if (final_index_is_fresh) free_value_contents(final_index_for_assignment); // Clean up index
+            } else {
+                if (!interpreter->prevent_side_effects) {
+                    perform_indexed_assignment(parent_container_for_final_assignment, final_index_for_assignment, val_to_set, target_name_token_for_error, attr_name_str);
+                } else if (final_index_is_fresh) {
+                    // If skipping assignment, we must still free the fresh index value.
+                    free_value_contents(final_index_for_assignment);
+                }
+            }
+
+            // Always free the RHS value if it was a temporary, as it was either consumed by assignment or unused.
+            if (rhs_res.is_freshly_created_container) free_value_contents(val_to_set); // perform_indexed_assignment copies or consumes
         } else if (interpreter->current_token->type == TOKEN_ASSIGN) { // self.attribute = value
             interpreter_eat(interpreter, TOKEN_ASSIGN); 
+            DEBUG_PRINTF("LET_STMT (self.attr): About to parse RHS. Current token: %s ('%s')",
+                         token_type_to_string(interpreter->current_token->type),
+                         interpreter->current_token->value ? interpreter->current_token->value : "N/A");
             ExprResult val_expr_res = interpret_expression(interpreter);
-            // Changed from interpret_ternary_expr to interpret_expression
             Value val_to_assign = val_expr_res.value;
-            if (interpreter->exception_is_active) { free(var_name_str); free(attr_name_str); free_value_contents(val_to_assign); return; }
-            symbol_table_set(interpreter->current_self_object->instance_attributes, attr_name_str, val_to_assign);
-            if (val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign); // symbol_table_set made a deep copy
+            if (interpreter->exception_is_active) {
+                free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error); if(val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign);
+                return STATEMENT_PROPAGATE_FLAG;
+            }
+            if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                DEBUG_PRINTF("LET_STMT (self.attr): RHS yielded for await. var_name='%s', attr_name='%s'. Pending assignment.",
+                             var_name_str, attr_name_str); // Log action
+                status = STATEMENT_YIELDED_AWAIT;
+                if(val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign); // RHS value will be re-evaluated
+                free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
+                return status;
+            } else if (interpreter->is_dummy_resume_value) {
+                interpreter->is_dummy_resume_value = false; // Consume flag
+                if (val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign);
+            } else {
+                if (!interpreter->prevent_side_effects) {
+                    DEBUG_PRINTF("LET_STMT (self.attr): Assigning to self attribute '%s'. Value type: %d", attr_name_str, val_to_assign.type);
+                    symbol_table_define(interpreter->current_self_object->instance_attributes, attr_name_str, val_to_assign);
+                }
+                if (val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign); // symbol_table_set made a deep copy
+            }
         } else {
-            free(var_name_str); free(attr_name_str);
+            free(var_name_str); free(attr_name_str); free_token(target_name_token_for_error);
             report_error_unexpected_token(interpreter, "'[' for indexed assignment or '=' for attribute assignment after 'self.attribute'");
         }
         free(attr_name_str); free(var_name_str);
-        interpreter_eat(interpreter, TOKEN_COLON); return;
+        free_token(target_name_token_for_error); // Free the copied token
+        interpreter_eat(interpreter, TOKEN_COLON); 
+        if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+            return STATEMENT_YIELDED_AWAIT;
+        }
+        return STATEMENT_EXECUTED_OK;
     }
     Value* current_val_ptr = symbol_table_get(interpreter->current_scope, var_name_str);
 
-    if (interpreter->current_token->type == TOKEN_LBRACKET) { // Indexed assignment
+    // This block replaces the old logic for indexed assignment, including the problematic `while` loop.
+    if (interpreter->current_token->type == TOKEN_LBRACKET) { // Indexed assignment var[idx1][idx2]... = value
         if (!current_val_ptr) {
             char err_msg[150];
             sprintf(err_msg, "Variable '%s' must be an existing collection for indexed assignment with 'let:'.", var_name_str);
-            free(var_name_str);
-            report_error("Runtime", err_msg, var_name_token);
+            free(var_name_str); free_token(target_name_token_for_error);
+            report_error("Runtime", err_msg, target_name_token_for_error);
         }
 
-        Value* target_container_ptr = current_val_ptr;
-        Value final_index_val;
-        int has_final_index = 0;
-        // Changed from interpret_ternary_expr to interpret_expression
+        Value* container_to_modify = current_val_ptr;
+        Value* parent_container_for_final_assignment = NULL;
+
+        Value final_index_for_assignment;
+        bool final_index_is_fresh = false;
 
         while (interpreter->current_token->type == TOKEN_LBRACKET) {
-            if (has_final_index) { // Navigating to a deeper level
-                if (target_container_ptr->type == VAL_ARRAY) {
-                    if (final_index_val.type != VAL_INT) { free(var_name_str); free_value_contents(final_index_val); report_error("Runtime", "Array index must be an integer for multi-level assignment.", var_name_token); }
-                    Array* arr = target_container_ptr->as.array_val;
-                    long idx = final_index_val.as.integer;
-                    if (idx < 0) idx += arr->count;
-                    if (idx < 0 || idx >= arr->count) { char err_msg[100]; sprintf(err_msg, "Index out of bounds for array '%s'", var_name_str); free(var_name_str); free_value_contents(final_index_val); report_error("Runtime", err_msg, var_name_token); }
-                    target_container_ptr = &arr->elements[idx];
-                } else if (target_container_ptr->type == VAL_DICT) {
-                    char err_msg[250]; // Increased buffer size
-                    sprintf(err_msg, "Multi-level dictionary assignment like dict[k1][k2]=v is not directly supported for '%s'. Assign to dict[k1] first if it's a sub-dictionary.", var_name_str);
-                    free(var_name_str); free_value_contents(final_index_val);
-                    report_error("Runtime", err_msg, var_name_token);
-                } else { free(var_name_str); free_value_contents(final_index_val); report_error("Runtime", "Cannot apply further indexing, intermediate value is not a collection.", var_name_token); }
-                free_value_contents(final_index_val);
-                has_final_index = 0;
-            }
+            parent_container_for_final_assignment = container_to_modify;
 
             interpreter_eat(interpreter, TOKEN_LBRACKET);
-            ExprResult final_idx_res = interpret_expression(interpreter);
-            final_index_val = final_idx_res.value;
-            if (interpreter->exception_is_active) { free(var_name_str); if(has_final_index) free_value_contents(final_index_val); return; }
-            interpreter_eat(interpreter, TOKEN_RBRACKET);
-            has_final_index = 1;
+            ExprResult index_res = interpret_expression(interpreter);
+            Value current_loop_index = index_res.value;
+            bool current_loop_index_is_fresh = index_res.is_freshly_created_container;
 
-            if (interpreter->current_token->type != TOKEN_ASSIGN && interpreter->current_token->type != TOKEN_LBRACKET) {
-                char err_msg[200];
-                sprintf(err_msg, "Expected '=' or '[' for further indexing after ']', but got %s.", token_type_to_string(interpreter->current_token->type));
-                free(var_name_str); free_value_contents(final_index_val);
-                report_error("Syntax", err_msg, interpreter->current_token);
+            if (interpreter->exception_is_active) {
+                if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                free(var_name_str); free_token(target_name_token_for_error);
+                return STATEMENT_PROPAGATE_FLAG;
+            } 
+            if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                free(var_name_str); free_token(target_name_token_for_error);
+                return STATEMENT_YIELDED_AWAIT;
             }
-            if (interpreter->current_token->type == TOKEN_ASSIGN) break;
+            interpreter_eat(interpreter, TOKEN_RBRACKET);
+
+            if (final_index_is_fresh) free_value_contents(final_index_for_assignment);
+            final_index_for_assignment = current_loop_index;
+            final_index_is_fresh = current_loop_index_is_fresh;
+
+            if (interpreter->current_token->type == TOKEN_ASSIGN) {
+                break; // End of LHS
+            }
+
+            // Descend
+            if (parent_container_for_final_assignment->type == VAL_ARRAY) {
+                if (current_loop_index.type != VAL_INT) {
+                    if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                    free(var_name_str); free_token(target_name_token_for_error);
+                    report_error("Runtime", "Array index must be an integer.", target_name_token_for_error);
+                }
+                long idx = current_loop_index.as.integer;
+                long effective_idx = idx >= 0 ? idx : parent_container_for_final_assignment->as.array_val->count + idx;
+
+                if (effective_idx < 0 || effective_idx >= parent_container_for_final_assignment->as.array_val->count) {
+                    char err_msg[150];
+                    snprintf(err_msg, sizeof(err_msg), "Array index %ld out of bounds for array '%s' (size %d).", idx, var_name_str, parent_container_for_final_assignment->as.array_val->count);
+                    if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                    free(var_name_str); free_token(target_name_token_for_error);
+                    report_error("Runtime", err_msg, target_name_token_for_error);
+                }
+                container_to_modify = &parent_container_for_final_assignment->as.array_val->elements[effective_idx];
+                if (current_loop_index_is_fresh) free_value_contents(current_loop_index); // Traversal index freed
+                final_index_is_fresh = false; 
+            } else if (parent_container_for_final_assignment->type == VAL_DICT) {
+                if (current_loop_index.type != VAL_STRING) {
+                    if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                    free(var_name_str); free_token(target_name_token_for_error);
+                    report_error("Runtime", "Dictionary key must be a string.", target_name_token_for_error);
+                }
+                
+                Value* next_container_ptr = dictionary_try_get_value_ptr(parent_container_for_final_assignment->as.dict_val, current_loop_index.as.string_val);
+                if (!next_container_ptr) {
+                    char err_msg[200];
+                    sprintf(err_msg, "Key '%s' not found in dictionary variable '%s' during chained assignment.", current_loop_index.as.string_val, var_name_str);
+                    if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                    free(var_name_str); free_token(target_name_token_for_error);
+                    report_error("Runtime", err_msg, target_name_token_for_error);
+                }
+                container_to_modify = next_container_ptr;
+                if (current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                final_index_is_fresh = false;
+            } else {
+                if(current_loop_index_is_fresh) free_value_contents(current_loop_index);
+                free(var_name_str); free_token(target_name_token_for_error);
+                report_error("Runtime", "Chained indexed assignment is only supported for nested arrays and dictionaries.", target_name_token_for_error);
+            }
         }
 
-        if (!has_final_index) { report_error("Internal", "Logic error in indexed assignment parsing for 'let:'.", var_name_token); }
-
-        interpreter_eat(interpreter, TOKEN_ASSIGN); // Expect '='
+        interpreter_eat(interpreter, TOKEN_ASSIGN);
         ExprResult new_val_res = interpret_expression(interpreter);
-        // Changed from interpret_ternary_expr to interpret_expression
         Value new_value_to_assign = new_val_res.value;
 
         if (interpreter->exception_is_active) {
-            free(var_name_str); free_value_contents(final_index_val); free_value_contents(new_value_to_assign); return;
+            if(final_index_is_fresh) free_value_contents(final_index_for_assignment);
+            if(new_val_res.is_freshly_created_container) free_value_contents(new_value_to_assign);
+            free(var_name_str); free_token(target_name_token_for_error);
+            return STATEMENT_PROPAGATE_FLAG;
+        } 
+        if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+            DEBUG_PRINTF("LET_STMT (indexed): RHS yielded for await. var_name='%s'. Pending assignment.", var_name_str);
+            status = STATEMENT_YIELDED_AWAIT;
+            if(final_index_is_fresh) free_value_contents(final_index_for_assignment);
+            if(new_val_res.is_freshly_created_container) free_value_contents(new_value_to_assign); // RHS value will be re-evaluated
+            free(var_name_str);
+            free_token(target_name_token_for_error);
+            return status;
         }
-
-        // perform_indexed_assignment will free final_index_val.
-        // new_value_to_assign is deep_copied by perform_indexed_assignment.
-        perform_indexed_assignment(target_container_ptr, final_index_val, new_value_to_assign, var_name_token, var_name_str); 
-        if (new_val_res.is_freshly_created_container) {
-            free_value_contents(new_value_to_assign);
+        if (interpreter->is_dummy_resume_value) {
+            interpreter->is_dummy_resume_value = false; // Consume flag
+            if (final_index_is_fresh) free_value_contents(final_index_for_assignment);
+        } else {
+            if (!interpreter->prevent_side_effects) {
+                perform_indexed_assignment(parent_container_for_final_assignment, final_index_for_assignment, new_value_to_assign, target_name_token_for_error, var_name_str);
+            } else if (final_index_is_fresh) {
+                // If skipping assignment, we must still free the fresh index value.
+                free_value_contents(final_index_for_assignment);
+            }
         }
-        // final_index_val is freed by perform_indexed_assignment
-
+        // Always free the RHS value if it was temporary
+        if (new_val_res.is_freshly_created_container) free_value_contents(new_value_to_assign);
     } else if (interpreter->current_token->type == TOKEN_ASSIGN) { // Simple assignment
         interpreter_eat(interpreter, TOKEN_ASSIGN);
+
+        DEBUG_PRINTF("LET_STMT_BEFORE_EXPR: Current token before interpret_expression: %s ('%s')",
+                     token_type_to_string(interpreter->current_token->type),
+                     interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+
         ExprResult val_expr_res = interpret_expression(interpreter);
         // Changed from interpret_ternary_expr to interpret_expression
         Value val_to_assign = val_expr_res.value;
-        if (interpreter->exception_is_active) {
-            free(var_name_str); free_value_contents(val_to_assign);
-            return;
-        }
+        DEBUG_PRINTF("LET_STMT (simple) AFTER_EXPR_VAL_ASSIGN: var_name='%s', coro_state=%d, val_type=%d, val_is_fresh=%d",
+                     var_name_str, interpreter->current_executing_coroutine ? (int)interpreter->current_executing_coroutine->state : -1,
+                     val_to_assign.type, val_expr_res.is_freshly_created_container);
+        DEBUG_PRINTF("LET_STMT (simple) AFTER_EXPR: Current token after interpret_expression: %s ('%s')",
+                    token_type_to_string(interpreter->current_token->type),
+                    interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+        
+        char* val_to_assign_str = value_to_string_representation(val_to_assign, interpreter, target_name_token_for_error);
+        DEBUG_PRINTF("LET_STMT (simple) AFTER_EXPR: val_to_assign (type %d, fresh: %d): %s. coro_state: %d",
+                     val_to_assign.type, val_expr_res.is_freshly_created_container, val_to_assign_str ? val_to_assign_str : "NULL_REPR", interpreter->current_executing_coroutine ? (int)interpreter->current_executing_coroutine->state : -1);
+        free(val_to_assign_str);
 
-        // New logic for 'let: var = value': update if exists in any scope, else create in current.
-        VarScopeInfo var_info = get_variable_definition_scope_and_value(interpreter->current_scope, var_name_str);
-        if (var_info.value_ptr) { // Variable exists in current or an outer scope
-            DEBUG_PRINTF("LET_STATEMENT: Updating existing variable '%s' in its definition scope %p.", var_name_str, (void*)var_info.definition_scope);
-            free_value_contents(*(var_info.value_ptr));       // Free old value's contents
-            *(var_info.value_ptr) = value_deep_copy(val_to_assign); // Assign new deep-copied value
-        } else { // Variable does not exist, create in current scope
-            DEBUG_PRINTF("LET_STATEMENT: Creating new variable '%s' in current scope %p.", var_name_str, (void*)interpreter->current_scope);
-            symbol_table_set(interpreter->current_scope, var_name_str, val_to_assign);
-        }
-
-        if (val_expr_res.is_freshly_created_container) {
-            free_value_contents(val_to_assign); // symbol_table_set made a deep copy
+        if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+            // --- YIELD PATH ---
+            // The expression on the RHS is yielding right now. We must suspend this statement.
+            DEBUG_PRINTF("LET_STMT (simple): RHS yielded for await. var_name='%s'. Pending assignment.", var_name_str);
+            status = STATEMENT_YIELDED_AWAIT;
+            // The RHS value will be re-evaluated on resume, so free any temporary value now.
+            if(val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign);
+            free(var_name_str);
+            free_token(target_name_token_for_error);
+            return status;
+        } else {
+            // --- NORMAL SYNC PATH ---
+            // The expression on the RHS was synchronous and did not yield.
+            if (interpreter->exception_is_active) { // Check for exception only in sync path after expr eval
+                free(var_name_str); free_token(target_name_token_for_error);
+                if(val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign);
+                return STATEMENT_PROPAGATE_FLAG;
+            }
+            if (interpreter->is_dummy_resume_value) {
+                interpreter->is_dummy_resume_value = false; // Consume flag
+                if (val_expr_res.is_freshly_created_container) free_value_contents(val_to_assign);
+            } else {
+                if (!interpreter->prevent_side_effects) {
+                    DEBUG_PRINTF("LET_STMT (simple) SYNC/RESUME: var_name='%s'. Assigning.", var_name_str);
+                    symbol_table_set(interpreter->current_scope, var_name_str, val_to_assign);
+                }
+                if (val_expr_res.is_freshly_created_container) {
+                    free_value_contents(val_to_assign); // symbol_table_set made a deep copy
+                }
+            }
         }
 
     } else {
         char err_msg[200];
-        sprintf(err_msg, "Expected '[' for indexed assignment or '=' for simple assignment after variable name '%s', but got %s.",
+        snprintf(err_msg, sizeof(err_msg), "Expected '[' for indexed assignment or '=' for simple assignment after variable name '%s', but got %s.",
                 var_name_str, token_type_to_string(interpreter->current_token->type));
-        free(var_name_str);
+        free(var_name_str); free_token(target_name_token_for_error);
         report_error("Syntax", err_msg, interpreter->current_token);
     }
 
     free(var_name_str);
+    // Always free target_name_token_for_error as it's local to this call.
+    free_token(target_name_token_for_error);
+    DEBUG_PRINTF("LET_STMT_BEFORE_FINAL_COLON: Current token: %s ('%s')",
+                 token_type_to_string(interpreter->current_token->type),
+                 interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+
     interpreter_eat(interpreter, TOKEN_COLON);
+    return status;
 }
 
-static void interpret_block_statement(Interpreter* interpreter) {
+static StatementExecStatus interpret_block_statement(Interpreter* interpreter) {
+    StatementExecStatus status = STATEMENT_EXECUTED_OK;
     Token* lbrace_token = interpreter->current_token;
     int lbrace_col = lbrace_token->col;
     interpreter_eat(interpreter, TOKEN_LBRACE);
@@ -410,10 +687,12 @@ static void interpret_block_statement(Interpreter* interpreter) {
                      lbrace_col + 4, interpreter->current_token->col);
             report_error("Syntax", err_msg, interpreter->current_token);
         }
-        if (interpreter->exception_is_active) { // If statement inside block raised
-            exit_scope(interpreter); return; // Still need to exit scope
+        status = interpret_statement(interpreter);
+        if (status != STATEMENT_EXECUTED_OK) {
+            // If a statement yields or propagates, exit scope and return status
+            exit_scope(interpreter);
+            return status;
         }
-        interpret_statement(interpreter);
     }
 
     if (interpreter->current_token->type == TOKEN_RBRACE) {
@@ -430,120 +709,131 @@ static void interpret_block_statement(Interpreter* interpreter) {
         report_error("Syntax", "Expected '}' to close block", interpreter->current_token);
     }
     exit_scope(interpreter);
+    return status; // Should be STATEMENT_EXECUTED_OK if reached here
 }
 
-static void skip_statements_in_branch(Interpreter* interpreter) {
-    // This function is primarily for skipping 'if'/'elif'/'else' branches.
-    // For skipping to a loop's 'end:', a more targeted skip is needed.
-    int nesting_level = 0; // General nesting for if/loop within the branch
-    Token* last_token_before_eof_skip = interpreter->current_token;
+// New implementation for skip_statements_in_branch
+static void skip_statements_in_branch(Interpreter* interpreter, int start_col) {
 
     while (interpreter->current_token->type != TOKEN_EOF) {
-        if (interpreter->current_token->type == TOKEN_IF || interpreter->current_token->type == TOKEN_LOOP) {
-            nesting_level++;
-        } else if (interpreter->current_token->type == TOKEN_END) {
-            if (nesting_level == 0) return; 
-            nesting_level--;
-        } else if (nesting_level == 0 &&
-                   (interpreter->current_token->type == TOKEN_ELIF ||
-                    interpreter->current_token->type == TOKEN_ELSE)) {
-            if (interpreter->exception_is_active) { // Exception during skip? Unlikely but check.
-                return;
-            }
-            return; 
+        if (interpreter->current_token->col <= start_col) {
+            return; // Stop skipping, leave the token for the caller.
         }
-        last_token_before_eof_skip = interpreter->current_token;
-        Token* old_token = interpreter->current_token;
+        Token* token_to_skip = interpreter->current_token;
         interpreter->current_token = get_next_token(interpreter->lexer);
-        free_token(old_token);
-    }
-    if (interpreter->exception_is_active) { // Exception during skip?
-        return;
-    }
-    if (nesting_level >= 0 && interpreter->current_token->type == TOKEN_EOF) {
-        char err_msg[300];
-        snprintf(err_msg, sizeof(err_msg), 
-                 "Unexpected EOF while skipping statements. Missing 'end:' for an 'if' or 'loop' structure that started near line %d, col %d?",
-                 last_token_before_eof_skip->line, last_token_before_eof_skip->col);
-        report_error("Syntax", err_msg, last_token_before_eof_skip);
+        free_token(token_to_skip);
     }
 }
 
 static void skip_to_loop_end(Interpreter* interpreter, int target_loop_col) {
-    int loop_nesting_level = 0; // Relative to the current loop being skipped
-    // Corrected to handle all block types that use 'end:'
     Token* last_token_before_eof_skip = interpreter->current_token;
 
     while(interpreter->current_token->type != TOKEN_EOF) {
-        if (interpreter->current_token->type == TOKEN_IF ||
-            interpreter->current_token->type == TOKEN_LOOP ||
-            interpreter->current_token->type == TOKEN_FUNCT ||
-            interpreter->current_token->type == TOKEN_TRY ||
-            interpreter->current_token->type == TOKEN_BLUEPRINT) {
-            loop_nesting_level++;
-        } else if (interpreter->current_token->type == TOKEN_END) {
-            if (loop_nesting_level == 0 && interpreter->current_token->col == target_loop_col) {
-                return; // Found the matching 'end:'
-            }
-            if (loop_nesting_level > 0) {
-                loop_nesting_level--;
-            }
+        if (interpreter->current_token->col <= target_loop_col) {
+            return; // Found end of block by dedentation
         }
         last_token_before_eof_skip = interpreter->current_token;
         Token* old_token = interpreter->current_token;
         interpreter->current_token = get_next_token(interpreter->lexer);
         free_token(old_token);
     }
-    if (interpreter->exception_is_active) { // Exception during skip?
-        return;
-    }
-    report_error("Syntax", "Unexpected EOF while skipping to loop 'end:'. Missing 'end:'?", last_token_before_eof_skip);
+    report_error("Syntax", "Unexpected EOF while skipping to loop end. Missing block terminator?", last_token_before_eof_skip);
 }
 
-static void execute_statements_in_controlled_block(Interpreter* interpreter, int expected_indent_col, const char* block_type_for_error, TokenType terminator1, TokenType terminator2, TokenType terminator3) {
-    Token* last_token_in_block = interpreter->current_token;
-    while (interpreter->current_token->type != terminator1 &&
-           interpreter->current_token->type != terminator2 &&
-           interpreter->current_token->type != terminator3 &&
-           interpreter->current_token->type != TOKEN_EOF) {
-        if (interpreter->current_token->col != expected_indent_col && interpreter->current_token->type != TOKEN_EOF) { // EOF col doesn't matter
+static StatementExecStatus execute_statements_in_controlled_block(Interpreter* interpreter, int start_col, const char* block_type_for_error, TokenType terminator1, TokenType terminator2, TokenType terminator3) {
+    Token* last_token_before_terminator_or_eof = NULL; // Initialize to NULL
+    int expected_body_indent = start_col + 4; // Body is indented 4 spaces more
+
+    // The top-level coroutine execution handles resuming from a yielded state by resetting the lexer.
+
+    while (1) {
+        if (last_token_before_terminator_or_eof) { // Free the old token if exists
+            free_token(last_token_before_terminator_or_eof);
+        }
+        last_token_before_terminator_or_eof = token_deep_copy(interpreter->current_token);
+
+        TokenType current_type = interpreter->current_token->type;
+        int current_col = interpreter->current_token->col;
+
+        if (current_type == TOKEN_EOF) {
+            break;
+        }
+
+        // If indentation drops, the block is over. If it's at the same level,
+        // it must be a valid terminator for this block type.
+        if (current_col < start_col || (current_col == start_col && (current_type == terminator1 || current_type == terminator2 || current_type == terminator3))) {
+            break;
+        }
+        if (current_col == start_col) { // Dedent to same level, but not a terminator
+            break;
+        }
+
+        // If we are here, we are inside the block. Check for correct indentation.
+        if (current_col != expected_body_indent) { // This check is now correct.
             char err_msg[300];
             snprintf(err_msg, sizeof(err_msg),
                      "Statement in '%s' block has incorrect indentation. Expected column %d, got column %d.",
-                     block_type_for_error, expected_indent_col, interpreter->current_token->col);
+                     block_type_for_error, expected_body_indent, current_col);
             report_error("Syntax", err_msg, interpreter->current_token);
         }
-        last_token_in_block = interpreter->current_token;
-        interpret_statement(interpreter);
-        // If interpret_statement processed a break, continue, return, or raised an exception, stop executing this block
-        if (interpreter->break_flag || interpreter->continue_flag || interpreter->return_flag || interpreter->exception_is_active) {
-            return;
+
+        StatementExecStatus status = interpret_statement(interpreter);
+
+        if (status == STATEMENT_YIELDED_AWAIT) {
+            // If a statement yields, just propagate the status up.
+            // Do NOT skip the rest of the block.
+            if (last_token_before_terminator_or_eof) free_token(last_token_before_terminator_or_eof);
+            return status;
+        } else if (status != STATEMENT_EXECUTED_OK) {
+            // For break, continue, return, exception, we DO skip the rest of the block.
+            skip_statements_in_branch(interpreter, start_col);
+            if (last_token_before_terminator_or_eof) {
+                free_token(last_token_before_terminator_or_eof);
+            }
+            return status; 
         }
     }
-    if (interpreter->current_token->type == TOKEN_EOF &&
-        interpreter->current_token->type != terminator1 &&
-        interpreter->current_token->type != terminator2 &&
-        interpreter->current_token->type != terminator3) {
-        char err_msg[300];
-         snprintf(err_msg, sizeof(err_msg), "Unexpected EOF in '%s' block. Missing '%s', '%s', or '%s' to terminate?",
+
+    if (interpreter->current_token->type == TOKEN_EOF) {
+        bool eof_is_valid_terminator = (terminator1 == TOKEN_EOF || terminator2 == TOKEN_EOF || terminator3 == TOKEN_EOF);
+        if (!eof_is_valid_terminator) {
+            char err_msg[300];
+            snprintf(err_msg, sizeof(err_msg), "Unexpected EOF in '%s' block. Missing '%s', '%s', or '%s' to terminate? Last processed token was near line %d, col %d.",
                  block_type_for_error,
                  token_type_to_string(terminator1),
                  token_type_to_string(terminator2),
-                 token_type_to_string(terminator3));
-        report_error("Syntax", err_msg, last_token_in_block);
+                 token_type_to_string(terminator3),
+                 last_token_before_terminator_or_eof->line, 
+                 last_token_before_terminator_or_eof->col);
+            Token temp_token_for_error = *last_token_before_terminator_or_eof;
+            temp_token_for_error.value = NULL; // Prevent use-after-free of the string value
+            free_token(last_token_before_terminator_or_eof);
+            last_token_before_terminator_or_eof = NULL; // Avoid double-free at the end of the function
+            report_error("Syntax", err_msg, &temp_token_for_error);
+        }
     }
+
+    if (last_token_before_terminator_or_eof) {
+        free_token(last_token_before_terminator_or_eof);
+    }
+
+    return STATEMENT_EXECUTED_OK;
 }
 
-static void execute_loop_body_iteration(Interpreter* interpreter, int loop_start_col, int expected_body_indent_col, const char* loop_type_for_error) {
-    Token* last_token_in_block = interpreter->current_token;
-    (void)last_token_in_block; // Potentially unused if loop body is empty or errors early
+static StatementExecStatus execute_loop_body_iteration(Interpreter* interpreter, int loop_start_col, int expected_body_indent_col, const char* loop_type_for_error) {
+    Token* last_token_in_block = NULL;
+
+    // Top-level coroutine execution handles resuming from a yielded state by resetting the lexer.
+    // This function now just executes statements in the current iteration.
 
     // Loop as long as the current token is part of the loop body
-    while (interpreter->current_token->type != TOKEN_EOF &&
-           !(interpreter->current_token->type == TOKEN_END && interpreter->current_token->col == loop_start_col) && // Not the loop's own end
-           interpreter->current_token->col >= expected_body_indent_col) { // Still indented as part of the body
+    while (interpreter->current_token->type != TOKEN_EOF && 
+           !(interpreter->current_token->col <= loop_start_col) && 
+           interpreter->current_token->col >= expected_body_indent_col) { 
+        
+        if (last_token_in_block) free_token(last_token_in_block); // Free previous copy
+        last_token_in_block = token_deep_copy(interpreter->current_token); // Make a new copy
         // Check if the current token signifies the end of the loop structure itself.
-
         if (interpreter->current_token->col != expected_body_indent_col) {
             char err_msg[300];
             snprintf(err_msg, sizeof(err_msg),
@@ -551,203 +841,172 @@ static void execute_loop_body_iteration(Interpreter* interpreter, int loop_start
                      loop_type_for_error, expected_body_indent_col, interpreter->current_token->col);
             report_error("Syntax", err_msg, interpreter->current_token);
         }
+ 
+        StatementExecStatus status = interpret_statement(interpreter);
 
-        // last_token_in_block = interpreter->current_token; // Update before each statement
-        interpret_statement(interpreter);
-
-        if (interpreter->break_flag || interpreter->continue_flag || interpreter->return_flag || interpreter->exception_is_active) {
-            // Stop this iteration if break, continue, return, or an exception was encountered/raised.
-            // The calling loop construct (e.g., interpret_for_loop) will then handle this flag.
-            return; 
+        // If the statement yielded, or caused a break/continue/return/exception,
+        // we must stop executing this block and propagate that status up.
+        if (status != STATEMENT_EXECUTED_OK) {
+            if (last_token_in_block) free_token(last_token_in_block);
+            return status;
         }
     }
 
-    if (interpreter->current_token->type == TOKEN_EOF &&
-        !(interpreter->current_token->type == TOKEN_END && interpreter->current_token->col == loop_start_col)) {
-        // This means EOF was hit before the loop's 'end:' token.
-        report_error("Syntax", "Unexpected EOF in loop body. Missing 'end:' to close loop?", interpreter->current_token); // Use current_token (EOF) for context
+    // The check for EOF was flawed. If the loop terminates due to EOF, it's a valid end of the program.
+    // The while loop condition correctly handles termination by dedentation.
+    if (last_token_in_block) {
+        free_token(last_token_in_block);
+    }
+    return STATEMENT_EXECUTED_OK; // Return OK if the block completes normally
+}
+
+static void skip_all_elif_and_else_branches(Interpreter* interpreter, int if_col) {
+    // This function is called after a branch has been taken and has yielded or propagated a control flow flag.
+    // It ensures the parser skips past the rest of the if-elif-else structure.
+    while (interpreter->current_token->type == TOKEN_ELIF && interpreter->current_token->col == if_col) {
+        interpreter_eat(interpreter, TOKEN_ELIF);
+        interpreter_eat(interpreter, TOKEN_COLON);
+        // We must skip the expression to avoid side effects and advance the lexer correctly.
+        interpreter->prevent_side_effects = true;
+        ExprResult dummy_res = interpret_expression(interpreter);
+        interpreter->prevent_side_effects = false;
+        if (dummy_res.is_freshly_created_container) free_value_contents(dummy_res.value);
+        interpreter_eat(interpreter, TOKEN_COLON);
+        skip_statements_in_branch(interpreter, if_col);
+    }
+    if (interpreter->current_token->type == TOKEN_ELSE && interpreter->current_token->col == if_col) {
+        interpreter_eat(interpreter, TOKEN_ELSE);
+        interpreter_eat(interpreter, TOKEN_COLON);
+        skip_statements_in_branch(interpreter, if_col);
     }
 }
 
-static void interpret_if_statement(Interpreter* interpreter) {
-    Token* if_keyword_token_for_context = interpreter->current_token;
-    int if_col = if_keyword_token_for_context->col; // Column of the 'if' keyword
-    int if_line = if_keyword_token_for_context->line; // Line of the 'if' keyword
+static StatementExecStatus interpret_if_statement(Interpreter* interpreter) { // New, robust implementation
+    Token* if_keyword_token_for_context = token_deep_copy(interpreter->current_token);
+    int if_col = if_keyword_token_for_context->col;
+    StatementExecStatus status = STATEMENT_EXECUTED_OK;
+    bool branch_taken = false;
+
+    // --- IF ---
     interpreter_eat(interpreter, TOKEN_IF);
     interpreter_eat(interpreter, TOKEN_COLON); // Colon after 'if'
     ExprResult cond_res = interpret_expression(interpreter);
-    // Changed from interpret_ternary_expr to interpret_expression
-    Value condition = cond_res.value;
+
     if (interpreter->exception_is_active) {
-        free_value_contents(condition);
-        return;
+        if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+        free_token(if_keyword_token_for_context);
+        return STATEMENT_PROPAGATE_FLAG;
+    }
+    if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+        if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+        free_token(if_keyword_token_for_context);
+        return STATEMENT_YIELDED_AWAIT;
     }
 
+    int condition_line = interpreter->current_token->line;
     interpreter_eat(interpreter, TOKEN_COLON);
-        // Changed from interpret_ternary_expr to interpret_expression
-
-    // Check indentation of the first statement in the 'if' body, if one exists.
-    // A branch is "empty" if the next token is elif/else/end/eof.
-    if (interpreter->current_token->type != TOKEN_ELIF &&
-        interpreter->current_token->type != TOKEN_ELSE &&
-        interpreter->current_token->type != TOKEN_END &&
-        interpreter->current_token->type != TOKEN_EOF) {
-        if (interpreter->current_token->col != if_col + 4) {
-            char err_msg[300];
-            snprintf(err_msg, sizeof(err_msg),
-                     "First statement in 'if' branch has incorrect indentation. Expected column %d, got column %d.",
-                     if_col + 4, interpreter->current_token->col);
-            report_error("Syntax", err_msg, interpreter->current_token);
-        }
+    if (interpreter->current_token->line == condition_line && interpreter->current_token->type != TOKEN_EOF) {
+        report_error("Syntax", "Unexpected token on the same line after 'if' condition. Expected a newline and an indented block.", interpreter->current_token);
     }
 
-    if (condition.type != VAL_BOOL) {
-        free_value_contents(condition);
-        report_error("Runtime", "Condition for 'if' statement must be a boolean.", if_keyword_token_for_context); // Use the token before it's eaten if possible, or pass line/col
+    if (interpreter->current_token->col <= if_col) {
+        free_token(if_keyword_token_for_context);
+        if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+        report_error("Syntax", "Expected an indented block after 'if' statement.", interpreter->current_token);
     }
-    int condition_is_true = condition.as.bool_val;
-    free_value_contents(condition); // Condition value is now used or discarded
 
-    int executed_a_branch = 0;
-
-    if (condition_is_true) {
-        executed_a_branch = 1;
-        execute_statements_in_branch(interpreter, if_col + 4, "if");
-        if (interpreter->exception_is_active) { // Exception in if branch
-            // The exception will propagate. We need to ensure 'end:' is still processed or skipped.
-            // For now, skip_statements_in_branch will handle finding the next elif/else/end.
-            skip_statements_in_branch(interpreter); // Skip to next structural token
-        }
+    if (value_is_truthy(cond_res.value)) {
+        branch_taken = true;
+        status = execute_statements_in_controlled_block(interpreter, if_col, "if", TOKEN_ELIF, TOKEN_ELSE, TOKEN_EOF);
+		if (status == STATEMENT_YIELDED_AWAIT) {
+			free_token(if_keyword_token_for_context);
+			if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+			return STATEMENT_YIELDED_AWAIT;
+		}
     } else {
-        skip_statements_in_branch(interpreter);
-        if (interpreter->exception_is_active) return; // Propagate if skip itself had an issue (unlikely)
+        skip_statements_in_branch(interpreter, if_col);
     }
+    if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
 
-    while (interpreter->current_token->type == TOKEN_ELIF) {
-        Token* elif_token = interpreter->current_token;
-        if (elif_token->col != if_col) {
-            char err_msg[200];
-            snprintf(err_msg, sizeof(err_msg),
-                     "'elif:' keyword (column %d) is not aligned with the preceding 'if:' (column %d).",
-                     elif_token->col, if_col);
-            report_error("Syntax", err_msg, elif_token);
+    // --- ELIFs ---
+    while (interpreter->current_token->type == TOKEN_ELIF && interpreter->current_token->col == if_col) {
+        if (branch_taken) { // A previous branch was taken, so just skip this entire clause
+            interpreter_eat(interpreter, TOKEN_ELIF); interpreter_eat(interpreter, TOKEN_COLON);
+            interpreter->prevent_side_effects = true;
+            ExprResult dummy = interpret_expression(interpreter);
+            interpreter->prevent_side_effects = false;
+            if (dummy.is_freshly_created_container) free_value_contents(dummy.value);
+            interpreter_eat(interpreter, TOKEN_COLON);
+            skip_statements_in_branch(interpreter, if_col);
+            continue;
         }
-
+        // This is the first branch to be considered after the initial 'if' failed.
+        Token* elif_token_for_error = token_deep_copy(interpreter->current_token);
         interpreter_eat(interpreter, TOKEN_ELIF);
         interpreter_eat(interpreter, TOKEN_COLON);
         ExprResult elif_cond_res = interpret_expression(interpreter);
-        Value elif_condition = elif_cond_res.value;
-        if (interpreter->exception_is_active) {
-            free_value_contents(elif_condition);
-            return; // Propagate
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            if (elif_cond_res.is_freshly_created_container) free_value_contents(elif_cond_res.value);
+            free_token(elif_token_for_error); free_token(if_keyword_token_for_context);
+            return interpreter->exception_is_active ? STATEMENT_PROPAGATE_FLAG : STATEMENT_YIELDED_AWAIT;
         }
-
+        int elif_cond_line = interpreter->current_token->line;
         interpreter_eat(interpreter, TOKEN_COLON);
-
-        // Check indentation of the first statement in the 'elif' body, if one exists.
-        if (interpreter->current_token->type != TOKEN_ELIF && // Not another elif
-            interpreter->current_token->type != TOKEN_ELSE &&
-            interpreter->current_token->type != TOKEN_END &&
-            interpreter->current_token->type != TOKEN_EOF) {
-            if (interpreter->current_token->col != if_col + 4) { // Still relative to the original if_col
-                char err_msg[300];
-                snprintf(err_msg, sizeof(err_msg),
-                         "First statement in 'elif' branch has incorrect indentation. Expected column %d, got column %d.",
-                         if_col + 4, interpreter->current_token->col);
-                report_error("Syntax", err_msg, interpreter->current_token);
-            }
+        if (interpreter->current_token->line == elif_cond_line && interpreter->current_token->type != TOKEN_EOF) {
+            report_error("Syntax", "Unexpected token on the same line after 'elif' condition. Expected a newline and an indented block.", interpreter->current_token);
+        }
+        if (interpreter->current_token->col <= if_col) {
+            free_token(if_keyword_token_for_context); free_token(elif_token_for_error);
+            report_error("Syntax", "Expected an indented block after 'elif' statement.", interpreter->current_token);
         }
 
-        if (executed_a_branch) { // If a previous branch (if or elif) was true
-            free_value_contents(elif_condition); // Still need to parse and free condition
-            skip_statements_in_branch(interpreter);
-            if (interpreter->exception_is_active) return;
+        if (value_is_truthy(elif_cond_res.value)) {
+            branch_taken = true;
+            status = execute_statements_in_controlled_block(interpreter, if_col, "elif", TOKEN_ELIF, TOKEN_ELSE, TOKEN_EOF);
+			if (status == STATEMENT_YIELDED_AWAIT) {
+				if (elif_cond_res.is_freshly_created_container) free_value_contents(elif_cond_res.value);
+				free_token(elif_token_for_error);
+				free_token(if_keyword_token_for_context);
+				return STATEMENT_YIELDED_AWAIT;
+			}
         } else {
-            // If an exception occurred in a previous skip_statements_in_branch, it would have returned.
-            // So, if we are here, no exception is active from prior skips.
-            if (elif_condition.type != VAL_BOOL) {
-                free_value_contents(elif_condition);
-                report_error("Runtime", "Condition for 'elif' statement must be a boolean.", elif_token);
-            }
-            int elif_is_true = elif_condition.as.bool_val;
-            free_value_contents(elif_condition);
-
-            if (elif_is_true) {
-                executed_a_branch = 1;
-                execute_statements_in_branch(interpreter, if_col + 4, "elif"); // elif body also indented relative to if_col
-                if (interpreter->exception_is_active) { // Exception in elif branch
-                    skip_statements_in_branch(interpreter); // Skip to next structural token
-                }
-            } else {
-                skip_statements_in_branch(interpreter);
-                if (interpreter->exception_is_active) return;
-
-            }
+            skip_statements_in_branch(interpreter, if_col);
         }
+        if (elif_cond_res.is_freshly_created_container) free_value_contents(elif_cond_res.value);
+        free_token(elif_token_for_error);
+
+        if (branch_taken) break; // Exit the while loop once a branch is taken
     }
 
-    if (interpreter->current_token->type == TOKEN_ELSE) {
-        Token* else_token = interpreter->current_token;
-        if (else_token->col != if_col) {
-            char err_msg[200];
-            snprintf(err_msg, sizeof(err_msg),
-                     "'else:' keyword (column %d) is not aligned with the preceding 'if:' (column %d).",
-                     else_token->col, if_col);
-            report_error("Syntax", err_msg, else_token);
-        }
-
+    // --- ELSE ---
+    if (!branch_taken && interpreter->current_token->type == TOKEN_ELSE && interpreter->current_token->col == if_col) {
+        Token* else_token_for_error = token_deep_copy(interpreter->current_token);
+        int else_line = else_token_for_error->line;
         interpreter_eat(interpreter, TOKEN_ELSE);
         interpreter_eat(interpreter, TOKEN_COLON);
-        // Check indentation of the first statement in the 'else' body, if one exists.
-        if (interpreter->current_token->type != TOKEN_END && // Not the end
-            interpreter->current_token->type != TOKEN_EOF) {
-            if (interpreter->current_token->col != if_col + 4) { // Still relative to the original if_col
-                char err_msg[300];
-                snprintf(err_msg, sizeof(err_msg),
-                         "First statement in 'else' branch has incorrect indentation. Expected column %d, got column %d.",
-                         if_col + 4, interpreter->current_token->col);
-                report_error("Syntax", err_msg, interpreter->current_token);
-            }
+        if (interpreter->current_token->line == else_line && interpreter->current_token->type != TOKEN_EOF)
+            report_error("Syntax", "Unexpected token on the same line after 'else:'. Expected a newline and an indented block.", interpreter->current_token);
+        if (interpreter->current_token->col <= if_col) {
+            free_token(else_token_for_error); free_token(if_keyword_token_for_context);
+            report_error("Syntax", "Expected an indented block after 'else' statement.", else_token_for_error);
         }
-
-        if (executed_a_branch) {
-            skip_statements_in_branch(interpreter);
-            if (interpreter->exception_is_active) return;
-        } else {
-            execute_statements_in_branch(interpreter, if_col + 4, "else"); // else body also indented relative to if_col
-            if (interpreter->exception_is_active) { // Exception in else branch
-                // No further branches to skip, 'end:' is next or error.
-            }
-        }
+        status = execute_statements_in_controlled_block(interpreter, if_col, "else", TOKEN_EOF, TOKEN_EOF, TOKEN_EOF);
+		if (status == STATEMENT_YIELDED_AWAIT) {
+			free_token(else_token_for_error);
+			free_token(if_keyword_token_for_context);
+			return STATEMENT_YIELDED_AWAIT;
+		}
+        free_token(else_token_for_error);
     }
 
-    if (interpreter->current_token->type == TOKEN_END) {
-        Token* end_token = interpreter->current_token;
-        if (end_token->col != if_col) {
-            char err_msg[250];
-            snprintf(err_msg, sizeof(err_msg),
-                     "'end:' keyword (column %d) is not aligned with the 'if:' (column %d) it closes.",
-                     end_token->col, if_col);
-            report_error("Syntax", err_msg, end_token);
-        }
-        interpreter_eat(interpreter, TOKEN_END);
-        interpreter_eat(interpreter, TOKEN_COLON);
-    } else {
-        if (interpreter->exception_is_active) { // If an exception is already propagating, don't report new syntax error
-            return;
-        }
-        char err_msg[256];
-        sprintf(err_msg, "Expected 'end:' (aligned with 'if:' at column %d) to close 'if/elif/else' structure that started near line %d, col %d. Found %s ('%s') at column %d.", 
-                if_col,
-                if_line, if_col,
-                token_type_to_string(interpreter->current_token->type),
-                interpreter->current_token->value ? interpreter->current_token->value : "",
-                (int)interpreter->current_token->col);
-        report_error("Syntax", err_msg, interpreter->current_token);
-    }
+    // After the correct branch has been executed (or skipped), we must skip any remaining parts of the structure.
+    skip_all_elif_and_else_branches(interpreter, if_col);
+
+    free_token(if_keyword_token_for_context);
+    return status;
 }
 
-static void interpret_break_statement(Interpreter* interpreter) {
+static void interpret_break_statement(Interpreter* interpreter) { // This function itself doesn't yield
     Token* break_token = interpreter->current_token;
     interpreter_eat(interpreter, TOKEN_BREAK);
     interpreter_eat(interpreter, TOKEN_COLON); // Colon after 'break'
@@ -758,7 +1017,14 @@ static void interpret_break_statement(Interpreter* interpreter) {
     interpreter->break_flag = 1;
 }
 
-static void interpret_continue_statement(Interpreter* interpreter) {
+static void interpret_skip_statement(Interpreter* interpreter) {
+    // This is a no-op statement, like 'pass' in Python.
+    // It's useful for empty blocks where syntax requires a statement.
+    interpreter_eat(interpreter, TOKEN_SKIP);
+    interpreter_eat(interpreter, TOKEN_COLON); // All simple statements end with a colon.
+}
+
+static void interpret_continue_statement(Interpreter* interpreter) { // This function itself doesn't yield too
     Token* continue_token = interpreter->current_token;
     interpreter_eat(interpreter, TOKEN_CONTINUE);
     interpreter_eat(interpreter, TOKEN_COLON); // Colon after 'continue'
@@ -770,7 +1036,7 @@ static void interpret_continue_statement(Interpreter* interpreter) {
 }
 
 static void interpret_funct_statement(Interpreter* interpreter, int statement_start_col, bool is_async_param) {
-    Token* funct_token_original_ref = interpreter->current_token;
+    Token* funct_token_original_ref = token_deep_copy(interpreter->current_token);
     int funct_def_col = statement_start_col; // Use the passed start column
     interpreter_eat(interpreter, TOKEN_FUNCT);
     interpreter_eat(interpreter, TOKEN_COLON);
@@ -779,17 +1045,19 @@ static void interpret_funct_statement(Interpreter* interpreter, int statement_st
     }
     char* func_name_str = strdup(interpreter->current_token->value);
     if (!func_name_str) {
-        report_error("System", "Failed to strdup function name.", interpreter->current_token);
+        report_error("System", "Failed to strdup function name.", funct_token_original_ref);
     }
     interpreter_eat(interpreter, TOKEN_ID);
 
-    Function* new_func = malloc(sizeof(Function));
+    Function* new_func = calloc(1, sizeof(Function));
     if (!new_func) {
         free(func_name_str);
         report_error("System", "Failed to allocate memory for Function struct.", funct_token_original_ref);
     }
 
     new_func->name = func_name_str;
+    new_func->definition_col = funct_def_col;
+    new_func->definition_line = funct_token_original_ref->line;
     new_func->params = NULL;
     new_func->param_count = 0;
     new_func->is_async = is_async_param;
@@ -798,6 +1066,8 @@ static void interpret_funct_statement(Interpreter* interpreter, int statement_st
     new_func->source_text_owned_copy = (char*)interpreter->lexer->text; // Cast away const for temporary assignment
     new_func->source_text_length = interpreter->lexer->text_length;
     new_func->is_source_owner = false; // This temporary Function struct does not own the source text yet.
+    new_func->body_end_token_original_line = -1; // Initialize to -1, meaning not pre-scanned
+    new_func->body_end_token_original_col = -1; // Initialize to -1
 
     interpreter_eat(interpreter, TOKEN_LPAREN);
     int param_capacity = 4;
@@ -869,7 +1139,7 @@ static void interpret_funct_statement(Interpreter* interpreter, int statement_st
                     free(new_func);
                     report_error("System", "Failed to alloc memory for default param value.", interpreter->current_token);
                 }
-                ExprResult default_val_expr_res = interpret_ternary_expr(interpreter); // Default value is an expression
+                ExprResult default_val_expr_res = interpret_expression(interpreter); // Default value is an expression
                 *(new_func->params[new_func->param_count].default_value) = default_val_expr_res.value;
                 if (interpreter->exception_is_active) { // Exception during default value parsing                    
                     report_error("Internal", "Exception during default param parsing. Further cleanup may be needed.", interpreter->current_token);
@@ -882,82 +1152,19 @@ static void interpret_funct_statement(Interpreter* interpreter, int statement_st
         }
     }
     interpreter_eat(interpreter, TOKEN_RPAREN);
+
+    // --- START: Stricter Syntax Check ---
+    int funct_header_line = interpreter->current_token->line;
     interpreter_eat(interpreter, TOKEN_COLON); // Colon after parameters
-
-    // Capture body start state
-    // Ensure the first token of the body (if any) is correctly indented.
-    // The body itself starts on the next line, indented by 4 spaces relative to `funct_def_col`.
-    if (interpreter->current_token->type != TOKEN_END && // Not an empty function ending immediately
-        interpreter->current_token->type != TOKEN_EOF) {
-        if (interpreter->current_token->col != funct_def_col + 4) {
-            char err_msg[300];
-            snprintf(err_msg, sizeof(err_msg),
-                     "First statement in function '%s' body has incorrect indentation. Expected column %d, got column %d.",
-                     new_func->name, funct_def_col + 4, interpreter->current_token->col);
-            report_error("Syntax", err_msg, interpreter->current_token);
-        }
-    }    
-    // Capture body start state for the *current_token* which is the first token of the body.
-    new_func->body_start_state = get_lexer_state_for_token_start(interpreter->lexer,
-                                                                 interpreter->current_token->line,
-                                                                 interpreter->current_token->col,
-                                                                 interpreter->current_token);
-
-    // Pre-scan to find the matching 'end:' token for this function
-    int nesting_level = 0;
-    Token* found_end_token_info = NULL; // Store info of the found end token
-    LexerState state_before_prescan = get_lexer_state(interpreter->lexer);
-    Token* token_to_restore_after_prescan = token_deep_copy(interpreter->current_token); // Current token is LPAREN or first param
-    Token* last_token_of_scan = NULL;
-
-    // Pre-scan loop using interpreter->current_token directly 
-    while(interpreter->current_token->type != TOKEN_EOF) {
-        DEBUG_PRINTF("Function Pre-scan for '%s': Token %s ('%s') at L%d C%d, Nesting: %d, TargetCol: %d",
-            new_func->name ? new_func->name : "<NULL_FUNC_NAME>",
-            token_type_to_string(interpreter->current_token->type),
-            interpreter->current_token->value ? interpreter->current_token->value : "",
-            interpreter->current_token->line, interpreter->current_token->col,
-            nesting_level, funct_def_col);        
-        if ( // interpreter->current_token->type == TOKEN_FUNCT || // Functions are not nested
-            interpreter->current_token->type == TOKEN_IF ||
-            interpreter->current_token->type == TOKEN_LOOP ||
-            interpreter->current_token->type == TOKEN_TRY) { // try also has an end
-            // For these, we only increment nesting if they are at a deeper or equal indent than the current function's body statements would be
-            nesting_level++;
-        } else if (interpreter->current_token->type == TOKEN_END) {
-            if (nesting_level == 0 && interpreter->current_token->type == TOKEN_END && interpreter->current_token->col == funct_def_col) {
-                found_end_token_info = token_deep_copy(interpreter->current_token);
-                last_token_of_scan = interpreter->current_token; // END token itself
-                break;
-            }
-            if (nesting_level > 0) nesting_level--;
-        } // Add other block-like structures if necessary
-
-        // Ensure the pre-scan respects indentation for finding the correct 'end:'
-        // This simple nesting count might not be robust enough for all cases if 'end:'
-        // can be used for different structures at different indentations.
-        Token* temp_tok_to_free = interpreter->current_token;
-        interpreter->current_token = get_next_token(interpreter->lexer);
-        free_token(temp_tok_to_free);
+    if (interpreter->current_token->line == funct_header_line && interpreter->current_token->type != TOKEN_EOF) {
+        report_error("Syntax", "Unexpected token on the same line after function signature. Expected a newline and an indented block.", interpreter->current_token);
     }
-    if (!found_end_token_info) { // Loop terminated by EOF
-        last_token_of_scan = interpreter->current_token; // EOF token
-    }
+    // --- END: Stricter Syntax Check ---
 
-    // Restore lexer and current_token to their state *before* the pre-scan.
-    set_lexer_state(interpreter->lexer, state_before_prescan);
-    // Free the token that was live at the end of the scan (END or EOF).
-    // token_to_restore_after_prescan is a distinct deep copy.
-    if (last_token_of_scan) {
-        free_token(last_token_of_scan);
-    }
-    interpreter->current_token = token_to_restore_after_prescan; // Assign the deep copied token back.
-
-    if (!found_end_token_info) {
-        char err_msg[256];
-        snprintf(err_msg, sizeof(err_msg), "Unclosed function definition for '%s'. Missing 'end:' aligned at column %d?",
-                 new_func->name, funct_def_col); 
-        // Cleanup before error:
+    // After the 'funct ... ():', the next token MUST be indented.
+    // If it's not, it's a syntax error (missing body).
+    if (interpreter->current_token->col <= funct_def_col) {
+        // Cleanup before error reporting
         free(new_func->name);
         if (new_func->params) {
             for (int i = 0; i < new_func->param_count; ++i) {
@@ -967,543 +1174,607 @@ static void interpret_funct_statement(Interpreter* interpreter, int statement_st
                     free(new_func->params[i].default_value);
                 }
             }
-            free(new_func->params);        }
-        // interpreter->current_token (restored token_to_restore_after_prescan) will be used for error context
-        // and freed by the main loop or caller of interpret_statement.
-        report_error("Syntax", err_msg, interpreter->current_token);
+            free(new_func->params);
+        }
+        free(new_func);
+        free_token(funct_token_original_ref);
+        report_error("Syntax", "Expected an indented block after function definition.", interpreter->current_token);
     }
 
+    // Capture body start state
+    // Ensure the first token of the body (if any) is correctly indented. // TOKEN_END removed
+    // The body itself starts on the next line, indented by 4 spaces relative to `funct_def_col`.
+    if (interpreter->current_token->col > funct_def_col && interpreter->current_token->type != TOKEN_EOF) {
+        if (interpreter->current_token->col != funct_def_col + 4) {
+            char err_msg[300];
+            snprintf(err_msg, sizeof(err_msg),
+                     "First statement in function '%s' body has incorrect indentation. Expected column %d, got column %d.",
+                     new_func->name, funct_def_col + 4, interpreter->current_token->col);
+            report_error("Syntax", err_msg, interpreter->current_token);
+        }    
+        LexerState absolute_body_start_state = get_lexer_state_for_token_start(interpreter->lexer,
+                                                                 interpreter->current_token->line,
+                                                                 interpreter->current_token->col,
+                                                                 interpreter->current_token);
+        new_func->body_start_state = absolute_body_start_state; // Store absolute for now, adjust when source_text_owned_copy is made
+    } else { // Empty function body
+        new_func->body_start_state = get_lexer_state_for_token_start(interpreter->lexer, interpreter->current_token->line, interpreter->current_token->col, interpreter->current_token); // Points to 'end'
+    }
 
-    new_func->body_end_token_original_line = found_end_token_info->line;
-    new_func->body_end_token_original_col = found_end_token_info->col;
-    free_token(found_end_token_info);
-
-    // Now, consume (skip over) the body tokens and the final 'end:' for this definition
-    while(!(interpreter->current_token->type == TOKEN_END &&
-            interpreter->current_token->line == new_func->body_end_token_original_line &&
-            interpreter->current_token->col == new_func->body_end_token_original_col) &&
-          interpreter->current_token->type != TOKEN_EOF) {
+    // The new logic: skip tokens until indentation is less than or equal to funct_def_col
+    // This assumes the function body is always indented by 4 spaces.
+    int expected_body_indent = funct_def_col + 4;
+    while (interpreter->current_token->type != TOKEN_EOF &&
+           interpreter->current_token->col >= expected_body_indent) {
+        // If the current token is at the same indentation level as the function definition,
+        // and it's not the start of the function body, then the function body has ended.
+        // This is a heuristic and might need refinement for complex cases.
         Token* temp_tok_to_free = interpreter->current_token;
         interpreter->current_token = get_next_token(interpreter->lexer);
         free_token(temp_tok_to_free);
     }
 
-    if (interpreter->current_token->type == TOKEN_END &&
-        interpreter->current_token->line == new_func->body_end_token_original_line &&
-        interpreter->current_token->col == new_func->body_end_token_original_col) {
-        interpreter_eat(interpreter, TOKEN_END);
-        interpreter_eat(interpreter, TOKEN_COLON);
-    } else {
-        // This case should ideally not be reached if pre-scan was correct and robust
-        // and the main loop of skipping tokens also worked.
-        report_error("Internal", "Failed to correctly skip to function's end token during definition.", funct_token_original_ref);
-    }
-
-    // After consuming the function's 'end:', 'interpreter->current_token' is now on the token *after* 'end:'.
-    // No further advancement is needed here as interpreter_eat handles it.
-    // The main interpret loop will pick up from this new current_token.
+    // The current_token is now the first token *after* the function body, at an indentation
+    // less than or equal to the function definition's column.
     Value func_val; func_val.type = VAL_FUNCTION; func_val.as.function_val = new_func;
-    symbol_table_set(interpreter->current_scope, new_func->name, func_val);
-    // Since symbol_table_set performs a deep copy (including allocating a new Function struct
-    // and copying its contents), the original 'new_func' created in this function
-    // and its dynamically allocated members are now orphaned if not explicitly freed.
-    
-    free(new_func->name); 
-    new_func->name = NULL;
-    if (new_func->params) {
-        for (int i = 0; i < new_func->param_count; ++i) {
-            free(new_func->params[i].name);
-            new_func->params[i].name = NULL;
-            if (new_func->params[i].default_value) {
-                free_value_contents(*(new_func->params[i].default_value));
-                free(new_func->params[i].default_value);
-                new_func->params[i].default_value = NULL;
-            }
-        }
-        free(new_func->params);
-        new_func->params = NULL;
-    }
-    free(new_func); // Free the original Function struct itself
+    symbol_table_define(interpreter->current_scope, new_func->name, func_val); // This makes a deep copy for the symbol table.
+
+    // Now, free the temporary `new_func` and its contents using the standard function.
+    free_value_contents(func_val);
+    free_token(funct_token_original_ref);
 }
 
-static void interpret_return_statement(Interpreter* interpreter) {
-    Token* return_keyword_token = interpreter->current_token;
+static StatementExecStatus interpret_return_statement(Interpreter* interpreter) {
+    StatementExecStatus status = STATEMENT_EXECUTED_OK;
+    Token* return_keyword_token = token_deep_copy(interpreter->current_token);
+    int start_line = return_keyword_token->line;
+
+    if (interpreter->function_nesting_level == 0 && !interpreter->current_executing_coroutine) {
+        report_error("Syntax", "'return:' statement found outside of a function.", return_keyword_token);
+    }
     interpreter_eat(interpreter, TOKEN_RETURN);
     interpreter_eat(interpreter, TOKEN_COLON); // Colon after 'return'
 
-    if (interpreter->function_nesting_level == 0) {
-        report_error("Syntax", "'return:' statement found outside of a function.", return_keyword_token);
+    // Case 1: Empty return (e.g., "return:" followed by a newline)
+    if (interpreter->current_token->line != start_line || interpreter->current_token->type == TOKEN_EOF) {
+        free_value_contents(interpreter->current_function_return_value);
+        interpreter->current_function_return_value = create_null_value();
+        interpreter->return_flag = 1;
+        free_token(return_keyword_token);
+        return STATEMENT_PROPAGATE_FLAG;
     }
 
-    ExprResult ret_expr_res = interpret_expression(interpreter);
-    Value return_expr_val = ret_expr_res.value;
-    if (interpreter->exception_is_active) {
-        free_value_contents(return_expr_val);
-        return;
+    // Case 2: One or more comma-separated expressions
+    #define MAX_RETURN_VALUES 16
+    ExprResult results[MAX_RETURN_VALUES];
+    int result_count = 0;
+
+    do {
+        if (result_count >= MAX_RETURN_VALUES) {
+            report_error("Syntax", "Exceeded maximum number of return values (16).", interpreter->current_token);
+        }
+        results[result_count] = interpret_expression(interpreter);
+
+        if (interpreter->exception_is_active || (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT)) {
+            for (int i = 0; i <= result_count; ++i) {
+                if (results[i].is_freshly_created_container) free_value_contents(results[i].value);
+            }
+            free_token(return_keyword_token);
+            return interpreter->exception_is_active ? STATEMENT_PROPAGATE_FLAG : STATEMENT_YIELDED_AWAIT;
+        }
+        result_count++;
+
+        if (interpreter->current_token->type == TOKEN_COMMA) {
+            interpreter_eat(interpreter, TOKEN_COMMA);
+        } else {
+            break;
+        }
+    } while (1);
+
+    Value final_return_value;
+    bool final_return_value_is_fresh = false;
+
+    if (result_count == 1) {
+        final_return_value = results[0].value;
+        final_return_value_is_fresh = results[0].is_freshly_created_container;
+    } else {
+        Tuple* tuple = malloc(sizeof(Tuple));
+        if (!tuple) report_error("System", "Failed to allocate memory for return tuple.", return_keyword_token);
+        tuple->count = result_count;
+        tuple->elements = malloc(result_count * sizeof(Value));
+        if (!tuple->elements) { free(tuple); report_error("System", "Failed to allocate memory for return tuple elements.", return_keyword_token); }
+
+        for (int i = 0; i < result_count; ++i) {
+            tuple->elements[i] = value_deep_copy(results[i].value);
+        }
+        final_return_value.type = VAL_TUPLE;
+        final_return_value.as.tuple_val = tuple;
+        final_return_value_is_fresh = true;
     }
 
     interpreter_eat(interpreter, TOKEN_COLON);
 
-    free_value_contents(interpreter->current_function_return_value); // Free previous (e.g. default null)
-    interpreter->current_function_return_value = value_deep_copy(return_expr_val);
-    interpreter->return_flag = 1;
-
-    if (ret_expr_res.is_freshly_created_container) {
-        free_value_contents(return_expr_val); // return_expr_val was copied by value_deep_copy
+    if (interpreter->current_token->line == start_line && interpreter->current_token->type != TOKEN_EOF) {
+        report_error("Syntax", "Unexpected token on the same line after return statement.", interpreter->current_token);
     }
+
+    free_value_contents(interpreter->current_function_return_value);
+    interpreter->current_function_return_value = value_deep_copy(final_return_value);
+    interpreter->return_flag = 1;
+    status = STATEMENT_PROPAGATE_FLAG; // Return is a propagation flag
+
+    for (int i = 0; i < result_count; ++i) {
+        if (results[i].is_freshly_created_container) free_value_contents(results[i].value);
+    }
+    // If multiple values were returned, a new tuple was created for final_return_value, which must also be freed.
+    // If only one value was returned, final_return_value was a shallow copy and was freed by the loop above.
+    if (result_count > 1 && final_return_value_is_fresh) {
+        free_value_contents(final_return_value);
+    }
+    free_token(return_keyword_token);
+    return status;
 }
 
-static void interpret_loop_statement(Interpreter* interpreter) {
-    Token* loop_keyword_token_for_context = interpreter->current_token;
+static StatementExecStatus interpret_loop_statement(Interpreter* interpreter) {
+    StatementExecStatus status = STATEMENT_EXECUTED_OK;
+    Token* loop_keyword_token_for_context = token_deep_copy(interpreter->current_token);
+    // Save the start state of the 'loop:' statement to potentially rewind to on async resume.
+    LexerState loop_statement_start_state = get_lexer_state_for_token_start(
+        interpreter->lexer, loop_keyword_token_for_context->line, loop_keyword_token_for_context->col, loop_keyword_token_for_context
+    );
+    (void)loop_statement_start_state; // Suppress unused variable warning
+
     int loop_col = loop_keyword_token_for_context->col;
     int loop_line = loop_keyword_token_for_context->line; // Keep loop_line for error context
     interpreter_eat(interpreter, TOKEN_LOOP);
     interpreter_eat(interpreter, TOKEN_COLON);
 
     if (interpreter->current_token->type == TOKEN_WHILE) {
-        interpret_while_loop(interpreter, loop_col, loop_line);
+        // This is the new control loop for 'while'
+        interpreter_eat(interpreter, TOKEN_WHILE);
+
+        // Capture the start of the condition expression ONCE.
+        LexerState condition_start_state = get_lexer_state_for_token_start(
+            interpreter->lexer,
+            interpreter->current_token->line,
+            interpreter->current_token->col,
+            interpreter->current_token
+        );
+
+        bool just_resumed = (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_RESUMING);
+
+        interpreter->loop_depth++;
+        bool is_first_pass_of_c_loop = true;
+
+        while (1) { // The new C control loop
+            // On the first pass of this C loop (whether it's the first time the statement
+            // is run, or the first time after an async resume), the lexer is already
+            // positioned at the start of the condition. On subsequent synchronous iterations,
+            // we must rewind to re-evaluate the condition.
+            if (is_first_pass_of_c_loop) {
+                is_first_pass_of_c_loop = false;
+                if (just_resumed) {
+                    just_resumed = false; // Consume the flag for the first pass
+                }
+                // The flag will be consumed by the await expression itself. We just check it here.
+            } else {
+                rewind_lexer_and_token(interpreter, condition_start_state, NULL);
+            }
+            Token* condition_token_for_error = token_deep_copy(interpreter->current_token);
+
+            // --- Part 1: Evaluate Condition ---
+            ExprResult cond_res = interpret_expression(interpreter);
+
+            if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                free_token(condition_token_for_error);
+                if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+                return STATEMENT_YIELDED_AWAIT;
+            }
+            if (interpreter->exception_is_active) {
+                free_token(condition_token_for_error);
+                if (cond_res.is_freshly_created_container) free_value_contents(cond_res.value);
+                free_token(loop_keyword_token_for_context);
+                return STATEMENT_PROPAGATE_FLAG;
+            }
+
+            Value condition = cond_res.value;
+            // --- START: Stricter Syntax Check ---
+            int while_cond_line = interpreter->current_token->line;
+            interpreter_eat(interpreter, TOKEN_COLON);
+            if (interpreter->current_token->line == while_cond_line && interpreter->current_token->type != TOKEN_EOF) {
+                report_error("Syntax", "Unexpected token on the same line after 'while' condition. Expected a newline and an indented block.", interpreter->current_token);
+            }
+            // --- END: Stricter Syntax Check ---
+
+            // After the 'while condition:', the next token MUST be indented.
+            if (interpreter->current_token->col <= loop_col) {
+                free_token(loop_keyword_token_for_context);
+                report_error("Syntax", "Expected an indented block after 'while' loop condition.", condition_token_for_error);
+            }
+
+            if (condition.type != VAL_BOOL) {
+                if (cond_res.is_freshly_created_container) free_value_contents(condition);
+                report_error("Runtime", "Condition for 'while' loop must be a boolean.", condition_token_for_error);
+                free_token(condition_token_for_error); // report_error exits
+                return STATEMENT_PROPAGATE_FLAG; 
+            }
+            free_token(condition_token_for_error);
+
+            bool should_continue_loop = condition.as.bool_val;
+            // VAL_BOOL has no complex contents to free via free_value_contents(condition)
+
+            if (!should_continue_loop) {
+                skip_to_loop_end(interpreter, loop_col);
+                if (interpreter->exception_is_active) { // Exception during skip
+                    free_token(loop_keyword_token_for_context);
+                    return STATEMENT_PROPAGATE_FLAG;
+                }
+                break; // Exit the C while(1) loop
+            }
+
+            // --- Part 2: Execute Body ---
+            // Check indentation of the first statement in the loop body, if one exists.
+            if (interpreter->current_token->col > loop_col && interpreter->current_token->type != TOKEN_EOF) {
+                if (interpreter->current_token->col != loop_col + 4) {
+                    char err_msg[300];
+                    snprintf(err_msg, sizeof(err_msg),
+                             "First statement in 'while' loop body has incorrect indentation. Expected column %d, got column %d.",
+                             loop_col + 4, interpreter->current_token->col);
+                    report_error("Syntax", err_msg, interpreter->current_token);
+                }
+            }            StatementExecStatus body_status = execute_loop_body_iteration(interpreter, loop_col, loop_col + 4, "while");
+
+            if (body_status == STATEMENT_YIELDED_AWAIT) {
+                free_token(loop_keyword_token_for_context);
+                return STATEMENT_YIELDED_AWAIT;
+            }
+
+            if (interpreter->break_flag) {
+                interpreter->break_flag = 0;
+                skip_to_loop_end(interpreter, loop_col);
+                if (interpreter->exception_is_active) { return STATEMENT_PROPAGATE_FLAG; }
+                break; 
+            }
+
+            if (interpreter->continue_flag) {
+                interpreter->continue_flag = 0;
+                continue; 
+            }
+
+            if (interpreter->return_flag || interpreter->exception_is_active) {
+                skip_to_loop_end(interpreter, loop_col);
+                free_token(loop_keyword_token_for_context);
+                return STATEMENT_PROPAGATE_FLAG;
+            }
+        } // End of the new C while(1) loop
+
+        status = STATEMENT_EXECUTED_OK; // If we finished the loop normally.
+
+        interpreter->loop_depth--;
     } else if (interpreter->current_token->type == TOKEN_FOR) {
-        interpret_for_loop(interpreter, loop_col, loop_line);
+        status = interpret_for_loop(interpreter, loop_col, loop_line, loop_keyword_token_for_context);
+        // If interpret_for_loop yielded, it will return STATEMENT_YIELDED_AWAIT.
+        // The interpret_for_loop function handles its own loop_depth decrement.
     } else {
         char err_msg[200];
         sprintf(err_msg, "Expected 'while' or 'for' after 'loop:', but got %s.",
                 token_type_to_string(interpreter->current_token->type));
+        free_token(loop_keyword_token_for_context);
         report_error("Syntax", err_msg, interpreter->current_token); // Error at current token, loop_keyword_token_for_context is eaten
-    }
+    } // The loop implicitly ends when indentation drops.
 
-    // Ensure 'end:' closes the loop structure
-    if (interpreter->current_token->type == TOKEN_END) {
-        Token* end_token = interpreter->current_token;
-        if (end_token->col != loop_col) {
-            char err_msg[250];
-            snprintf(err_msg, sizeof(err_msg),
-                    "'end:' keyword (column %d) is not aligned with the 'loop:' (column %d) it closes.",
-                    end_token->col, loop_col);
-            report_error("Syntax", err_msg, end_token);
-        }
-        interpreter_eat(interpreter, TOKEN_END);
-        interpreter_eat(interpreter, TOKEN_COLON);
-    } else {
-        if (interpreter->exception_is_active) { // If an exception is already propagating
-            return;
-        }
-        // If 'end:' is not found immediately, it's a structural error.
-        // The loop body execution should have positioned the token correctly,
-        // or skip_statements_in_branch (if break/continue occurred) should have.
-        // If we are here, it means the loop body didn't end where expected or a break/continue path is flawed.
-        char err_msg[256];
-        sprintf(err_msg, "Expected 'end:' (aligned with 'loop:' at column %d) to close 'loop' structure that started near line %d, col %d. Found %s ('%s') at column %d.",
-                loop_col,
-                loop_line, loop_col, // Use saved line and column of 'loop:'
-                token_type_to_string(interpreter->current_token->type),
-                interpreter->current_token->value ? interpreter->current_token->value : "",
-                (int)interpreter->current_token->col);
-        report_error("Syntax", err_msg, interpreter->current_token);
-    }
+    free_token(loop_keyword_token_for_context);
+    return status;
 }
 
-static void interpret_while_loop(Interpreter* interpreter, int loop_col, int loop_line) {
-    // Token* while_keyword_token = interpreter->current_token; // Was unused
-    interpreter_eat(interpreter, TOKEN_WHILE); // Consume 'while'
-    // After eating TOKEN_WHILE, interpreter->current_token is the first token of the condition.
-    // We need to capture the LexerState that corresponds to the *start* of this token.
-    LexerState condition_start_lexer_state = get_lexer_state_for_token_start(interpreter->lexer, 
-                                                                             interpreter->current_token->line,
-                                                                             interpreter->current_token->col,
-                                                                             interpreter->current_token); // Pass current token for error context
-    (void)loop_line;
-    interpreter->loop_depth++;
-    while(1) {
-        Token* condition_start_token = interpreter->current_token;
-        ExprResult cond_res = interpret_expression(interpreter);
-        // Changed from interpret_ternary_expr to interpret_expression
-        Value condition = cond_res.value;
-        if (interpreter->exception_is_active) {
-            free_value_contents(condition);
-            interpreter->loop_depth--; return;
-        }
-
-        interpreter_eat(interpreter, TOKEN_COLON); // Expect colon after condition
-
-        if (condition.type != VAL_BOOL) {
-            free_value_contents(condition);
-            interpreter->loop_depth--; // Decrement before erroring out
-            report_error("Runtime", "Condition for 'while' loop must be a boolean.", condition_start_token);
-        }
-
-        if (!condition.as.bool_val) {
-            free_value_contents(condition);
-            skip_to_loop_end(interpreter, loop_col);
-            if (interpreter->exception_is_active) { interpreter->loop_depth--; return; }
-            break; // Exit the C while(1) loop
-        }
-        free_value_contents(condition);
-
-        // Check indentation of the first statement in the loop body, if one exists.
-        int body_actual_indent = loop_col + 4; // Body indented 4 spaces relative to 'loop:'
-        if (interpreter->current_token->type != TOKEN_END && interpreter->current_token->type != TOKEN_EOF) {
-            if (interpreter->current_token->col != body_actual_indent) {
-                char err_msg[300];
-                snprintf(err_msg, sizeof(err_msg),
-                         "First statement in 'while' loop body has incorrect indentation. Expected column %d, got column %d.",
-                         body_actual_indent, interpreter->current_token->col);
-                report_error("Syntax", err_msg, interpreter->current_token);
-            }
-        } else if (interpreter->current_token->type == TOKEN_END && interpreter->current_token->col != loop_col) {
-             char err_msg[250];
-            snprintf(err_msg, sizeof(err_msg),
-                     "'end:' keyword (column %d) for 'while' loop is not aligned with the 'loop:' (column %d). Loop body might be empty or missing.",
-                     interpreter->current_token->col, loop_col);
-            report_error("Syntax", err_msg, interpreter->current_token);
-        } // Pass loop_col for the 'loop:' keyword's column, and body_actual_indent for the body statements
-        execute_loop_body_iteration(interpreter, loop_col, body_actual_indent, "while");
-
-        if (interpreter->break_flag) {
-            interpreter->break_flag = 0;
-            skip_to_loop_end(interpreter, loop_col);
-            if (interpreter->exception_is_active) { interpreter->loop_depth--; return; }
-            break; // Exit C while(1)
-        }
-        if (interpreter->exception_is_active) { interpreter->loop_depth--; return; } // Exception from body
-        if (interpreter->continue_flag) {
-            interpreter->continue_flag = 0; // Reset for this loop level
-            // Body has been executed or skipped by execute_loop_body_iteration.
-            // Rewind to re-evaluate the condition for the next iteration.
-            // The body has already been skipped by execute_loop_body_iteration returning.
-            rewind_lexer_and_token(interpreter, condition_start_lexer_state, NULL); 
-            continue; // Continue the C while(1) loop to re-evaluate condition
-        }
-
-        // If execute_loop_body_iteration returned because it saw TOKEN_END at loop_col,
-        // current_token will be that TOKEN_END. The outer C while loop condition will handle termination.
-        // If it returned due to dedent, current_token is the dedented token.
-        // Rewind to re-evaluate condition for the next iteration
-        if (interpreter->return_flag) { // Check for return_flag after body execution
-            interpreter->loop_depth--;
-            // Do not reset return_flag here.
-            skip_to_loop_end(interpreter, loop_col); // Ensure parser is past the loop
-            return; // Propagate the return
-        }
-
-        if (interpreter->exception_is_active) { // Exception from body
-            // Ensure we skip to the loop's end before propagating the exception fully
-            skip_to_loop_end(interpreter, loop_col);
-            interpreter->loop_depth--; return;
-        }
-        rewind_lexer_and_token(interpreter, condition_start_lexer_state, NULL);
-    }
-    interpreter->loop_depth--;
-    // Clear flags if this was the outermost loop being exited by break/natural end
-    if (interpreter->loop_depth == 0) {
-        interpreter->break_flag = 0;
-        interpreter->continue_flag = 0;
-    }
-}
-
-static void interpret_for_loop(Interpreter* interpreter, int loop_col, int loop_line) {
+static StatementExecStatus interpret_for_loop(Interpreter* interpreter, int loop_col, int loop_line, Token* loop_keyword_token_for_context) {
+    StatementExecStatus status = STATEMENT_EXECUTED_OK;
     (void)loop_line; // Mark as unused
+    (void)loop_keyword_token_for_context; // Mark as unused for now
     interpreter_eat(interpreter, TOKEN_FOR);
     // Changed from interpret_ternary_expr to interpret_expression
-    Token* var_name_token = interpreter->current_token;
-    if (var_name_token->type != TOKEN_ID) {
-        report_error("Syntax", "Expected identifier for loop variable after 'for'.", var_name_token);
-    }
-    char* var_name_str = strdup(var_name_token->value);
+    Token* var_name_token = token_deep_copy(interpreter->current_token); // For error reporting
+    if (var_name_token->type != TOKEN_ID) report_error("Syntax", "Expected identifier for loop variable after 'for'.", var_name_token);
+    char* var_name_str = strdup(var_name_token->value); // This is the public loop variable name
+    if (!var_name_str) report_error("System", "Failed to allocate memory for loop variable name.", var_name_token);
     interpreter_eat(interpreter, TOKEN_ID);
 
+    // 1. Create a single, persistent scope for the entire 'for' loop.
+    enter_scope(interpreter);
     interpreter->loop_depth++;
+
     int body_indent = loop_col + 4; // Body indented 4 spaces relative to 'loop:'
 
     if (interpreter->current_token->type == TOKEN_FROM) { // Range loop
+        // --- START: New async-safe for...from...to implementation ---
         interpreter_eat(interpreter, TOKEN_FROM);
-        ExprResult start_val_expr_res = interpret_expression(interpreter);
-        Value start_val_expr = start_val_expr_res.value;
-        if (interpreter->exception_is_active) { free(var_name_str); free_value_contents(start_val_expr); interpreter->loop_depth--; return; }
+        
+        // On first entry, evaluate start/end/step and store them.
+        // On resume, these expressions are NOT re-evaluated. The loop continues from where it was.
+        // This requires storing the loop state (current value, end, step) in the loop's scope.
+        
+        // Create hidden variable names
+        char end_var_name[256], step_var_name[256];
+        snprintf(end_var_name, sizeof(end_var_name), "__%s_end", var_name_str);
+        snprintf(step_var_name, sizeof(step_var_name), "__%s_step", var_name_str);
 
-        interpreter_eat(interpreter, TOKEN_TO);
-        ExprResult end_val_expr_res = interpret_expression(interpreter);
-        Value end_val_expr = end_val_expr_res.value;
-        if (interpreter->exception_is_active) { free(var_name_str); free_value_contents(start_val_expr); free_value_contents(end_val_expr); interpreter->loop_depth--; return; }
+        bool just_resumed = (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_RESUMING);
 
-        Value step_val_expr; step_val_expr.type = VAL_INT; step_val_expr.as.integer = 1; // Default
+        Value* loop_var_ptr = symbol_table_get_local(interpreter->current_scope, var_name_str);
 
-        if (interpreter->current_token->type == TOKEN_STEP) {
-            interpreter_eat(interpreter, TOKEN_STEP);
-            ExprResult step_val_expr_res = interpret_expression(interpreter);
-            step_val_expr = step_val_expr_res.value; // Overwrite default if step provided
-            if (interpreter->exception_is_active) {
-                free(var_name_str); free_value_contents(start_val_expr); free_value_contents(end_val_expr); free_value_contents(step_val_expr);
-                interpreter->loop_depth--; return;
+        if (loop_var_ptr == NULL) { // First time entering this loop
+            ExprResult start_res = interpret_expression(interpreter);
+            if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                if (start_res.is_freshly_created_container) free_value_contents(start_res.value);
+                status = STATEMENT_YIELDED_AWAIT;
+                goto cleanup_for_loop;
             }
+            if (interpreter->exception_is_active) { if (start_res.is_freshly_created_container) free_value_contents(start_res.value); status = STATEMENT_PROPAGATE_FLAG; goto cleanup_for_loop; }
+            interpreter_eat(interpreter, TOKEN_TO);
+            ExprResult end_res = interpret_expression(interpreter);
+            if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                if (start_res.is_freshly_created_container) free_value_contents(start_res.value);
+                if (end_res.is_freshly_created_container) free_value_contents(end_res.value);
+                status = STATEMENT_YIELDED_AWAIT;
+                goto cleanup_for_loop;
+            }
+            if (interpreter->exception_is_active) { if (start_res.is_freshly_created_container) free_value_contents(start_res.value); if (end_res.is_freshly_created_container) free_value_contents(end_res.value); status = STATEMENT_PROPAGATE_FLAG; goto cleanup_for_loop; }
+            
+            Value step_val; step_val.type = VAL_INT; step_val.as.integer = 1;
+            bool step_is_fresh = false;
+            if (interpreter->current_token->type == TOKEN_STEP) {
+                interpreter_eat(interpreter, TOKEN_STEP);
+                ExprResult step_res = interpret_expression(interpreter);
+                if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+                    if (start_res.is_freshly_created_container) free_value_contents(start_res.value);
+                    if (end_res.is_freshly_created_container) free_value_contents(end_res.value);
+                    if (step_res.is_freshly_created_container) free_value_contents(step_res.value);
+                    status = STATEMENT_YIELDED_AWAIT;
+                    goto cleanup_for_loop;
+                }
+                if (interpreter->exception_is_active) { if (start_res.is_freshly_created_container) free_value_contents(start_res.value); if (end_res.is_freshly_created_container) free_value_contents(end_res.value); if (step_res.is_freshly_created_container) free_value_contents(step_res.value); status = STATEMENT_PROPAGATE_FLAG; goto cleanup_for_loop; }
+                step_val = step_res.value;
+                step_is_fresh = step_res.is_freshly_created_container;
+            }
+
+            // --- START: Stricter Syntax Check ---
+            int for_header_line = interpreter->current_token->line;
+            interpreter_eat(interpreter, TOKEN_COLON);
+            if (interpreter->current_token->line == for_header_line && interpreter->current_token->type != TOKEN_EOF) {
+                report_error("Syntax", "Unexpected token on the same line after 'for...from...to' header. Expected a newline and an indented block.", interpreter->current_token);
+            }
+            // --- END: Stricter Syntax Check ---
+
+            if (!((start_res.value.type == VAL_INT || start_res.value.type == VAL_FLOAT) && (end_res.value.type == VAL_INT || end_res.value.type == VAL_FLOAT) && (step_val.type == VAL_INT || step_val.type == VAL_FLOAT))) {
+                report_error("Runtime", "Start, end, and step values for 'for...from...to' loop must be numbers.", var_name_token);
+            }
+
+            // Store loop parameters in hidden variables within the loop's scope
+            symbol_table_define(interpreter->current_scope, end_var_name, end_res.value);
+            symbol_table_define(interpreter->current_scope, step_var_name, step_val);
+            // Initialize the public loop variable
+            symbol_table_define(interpreter->current_scope, var_name_str, start_res.value);
+
+            if (start_res.is_freshly_created_container) free_value_contents(start_res.value);
+            if (end_res.is_freshly_created_container) free_value_contents(end_res.value);
+            if (step_is_fresh) free_value_contents(step_val);
         }
 
-        interpreter_eat(interpreter, TOKEN_COLON); // Consumes COLON. current_token is now first token of body.
-        // current_token is now the first token of the loop body.
-        // We need the LexerState corresponding to the *start* of this token.
+        if (interpreter->current_token->col <= loop_col) report_error("Syntax", "Expected an indented block after 'for...from...to' statement.", loop_keyword_token_for_context);
         LexerState loop_body_start_lexer_state = get_lexer_state_for_token_start(interpreter->lexer,
-                                                                                 interpreter->current_token->line,
-                                                                                 interpreter->current_token->col,
-                                                                                 interpreter->current_token);
+                                                                                  interpreter->current_token->line,
+                                                                                  interpreter->current_token->col,
+                                                                                  interpreter->current_token);
 
-        if (!((start_val_expr.type == VAL_INT || start_val_expr.type == VAL_FLOAT) &&
-              (end_val_expr.type == VAL_INT || end_val_expr.type == VAL_FLOAT) &&
-              (step_val_expr.type == VAL_INT || step_val_expr.type == VAL_FLOAT))) {
-            free(var_name_str); free_value_contents(start_val_expr); free_value_contents(end_val_expr); if(interpreter->current_token->type != TOKEN_COLON) free_value_contents(step_val_expr);
-            interpreter->loop_depth--; report_error("Runtime", "Start, end, and step values for 'for...from...to' loop must be numbers.", var_name_token);
-        }
-        double start_d = (start_val_expr.type == VAL_INT) ? start_val_expr.as.integer : start_val_expr.as.floating;
-        double end_d = (end_val_expr.type == VAL_INT) ? end_val_expr.as.integer : end_val_expr.as.floating;
-        double step_d = (step_val_expr.type == VAL_INT) ? step_val_expr.as.integer : step_val_expr.as.floating;
-        free_value_contents(start_val_expr); free_value_contents(end_val_expr); if(interpreter->current_token->type != TOKEN_COLON && step_val_expr.type != VAL_INT) free_value_contents(step_val_expr);
 
-        if (step_d == 0) { free(var_name_str); interpreter->loop_depth--; report_error("Runtime", "Step value in 'for...from...to' loop cannot be zero.", var_name_token); }
+        
+        while(1) { // Async-safe loop
+            // Get current loop state from scope
+            Value* i_val = symbol_table_get_local(interpreter->current_scope, var_name_str);
+            Value* end_val = symbol_table_get_local(interpreter->current_scope, end_var_name);
+            Value* step_val = symbol_table_get_local(interpreter->current_scope, step_var_name);
 
-        // Check for no-iteration condition before starting the loop
-        int no_iterations = 0;
-        if (step_d > 0 && start_d > end_d) {
-            no_iterations = 1;
-        } else if (step_d < 0 && start_d < end_d) {
-            no_iterations = 1;
-        }
+            if (!i_val || !end_val || !step_val) report_error("Internal", "Loop state variables missing in for...from...to loop.", var_name_token);
 
-        if (no_iterations) {
-            skip_to_loop_end(interpreter, loop_col);
-            if (interpreter->exception_is_active) { interpreter->loop_depth--; free(var_name_str); return; }
-        } else {
-            for (double i = start_d; (step_d > 0) ? (i <= end_d) : (i >= end_d); i += step_d) {
-                DEBUG_PRINTF("FOR_LOOP (Range): Iteration start. C var i = %f. Current scope before enter_scope: %p", i, (void*)interpreter->current_scope);
-                enter_scope(interpreter);
-                DEBUG_PRINTF("FOR_LOOP (Range): After enter_scope. New current scope: %p", (void*)interpreter->current_scope);
-                Value loop_var_val;
-                if (fmod(i, 1.0) == 0.0) { loop_var_val.type = VAL_INT; loop_var_val.as.integer = (long)i; }
-                else { loop_var_val.type = VAL_FLOAT; loop_var_val.as.floating = i; }
+            double i_d = (i_val->type == VAL_INT) ? i_val->as.integer : i_val->as.floating;
+            double end_d = (end_val->type == VAL_INT) ? end_val->as.integer : end_val->as.floating;
+            double step_d = (step_val->type == VAL_INT) ? step_val->as.integer : step_val->as.floating;
 
-                if (strcmp(var_name_str, "i") == 0) { // Specific log for the 'i' variable from the test, C var is also 'i'
-                    DEBUG_PRINTF("  Preparing to set EchoC var '%s'. C var i = %f.", var_name_str, i);
-                    if (loop_var_val.type == VAL_INT) DEBUG_PRINTF("    loop_var_val: Type: VAL_INT, Value: %ld", loop_var_val.as.integer);
-                    else DEBUG_PRINTF("    loop_var_val: Type: VAL_FLOAT, Value: %f", loop_var_val.as.floating);
-                }
-
-                symbol_table_set(interpreter->current_scope, var_name_str, loop_var_val); // loop_var_val is copied
-
-                // Rewind to the start of the loop body for this iteration
-                rewind_lexer_and_token(interpreter, loop_body_start_lexer_state, NULL);
-
-                if (interpreter->current_token->type != TOKEN_END && interpreter->current_token->type != TOKEN_EOF && interpreter->current_token->col != body_indent) {
-                    char err_msg[300];
-                    snprintf(err_msg, sizeof(err_msg),
-                             "First statement in 'for...from...to' loop body has incorrect indentation. Expected column %d, got column %d.",
-                             body_indent, interpreter->current_token->col);
-                    report_error("Syntax", err_msg, interpreter->current_token);
-                }
-                DEBUG_PRINTF("FOR_LOOP (Range): Executing loop body. Current scope: %p", (void*)interpreter->current_scope);
-                execute_loop_body_iteration(interpreter, loop_col, body_indent, "for...from...to");
-                // Check for return_flag after body execution, before exit_scope for this iteration
-                if (interpreter->return_flag) {
-                    exit_scope(interpreter); // Still need to exit the iteration's scope
-                    interpreter->loop_depth--;
-                    skip_to_loop_end(interpreter, loop_col); // Ensure parser is past the loop
-                    goto end_for_range_loop_label; // Use goto to break out of C for-loop and then handle cleanup
-                }
-                exit_scope(interpreter);
-                if (interpreter->exception_is_active) { interpreter->loop_depth--; free(var_name_str); return; }
-                if (interpreter->break_flag) { 
-                    interpreter->break_flag = 0; 
-                    // skip_to_loop_end will be called after the C for-loop
-                    if (interpreter->exception_is_active) { interpreter->loop_depth--; free(var_name_str); return; }
-                    goto end_for_range_loop_label; // Use goto to break out of the C for-loop
-                }
-                if (interpreter->continue_flag) { 
-                    interpreter->continue_flag = 0; 
-                    // C for loop will naturally continue to next `i`.
-                    // execute_loop_body_iteration would have handled the current iteration's statements.
-                    // If an exception occurred during continue's processing within the body,
-                    // it should have been caught by the exception_is_active check above.
-                    // No explicit rewind needed here as the C for loop handles iteration.
-                }
+            // Check termination condition
+            if ((step_d > 0 && i_d > end_d) || (step_d < 0 && i_d < end_d)) {
+                break; // Exit while(1)
             }
-            end_for_range_loop_label:; // Label for break to jump to
-            if (interpreter->return_flag) { // If loop exited due to return_flag
-                free(var_name_str); // var_name_str was allocated in this function
-                return; // Propagate the return (loop_depth already decremented)
-            }        }
-        // After the C for-loop (natural finish, break, or no iterations for range loop),
-        // ensure the parser is positioned at the EchoC loop's 'end:' token.
-        if (!interpreter->exception_is_active) { // Don't skip if an exception is already propagating
-            skip_to_loop_end(interpreter, loop_col);
+
+            // Execute body
+            if (just_resumed) {
+                DEBUG_PRINTF("FOR_LOOP (Range): Resuming from await, not rewinding body lexer.%s", "");
+                just_resumed = false; // Consume the resume signal
+            } else {
+                rewind_lexer_and_token(interpreter, loop_body_start_lexer_state, NULL);
+            }
+            StatementExecStatus body_status = execute_loop_body_iteration(interpreter, loop_col, body_indent, "for...from...to");
+
+            if (body_status == STATEMENT_YIELDED_AWAIT) {
+                status = STATEMENT_YIELDED_AWAIT;
+                goto cleanup_for_loop;
+            }
+            if (interpreter->return_flag || interpreter->exception_is_active) {
+                status = STATEMENT_PROPAGATE_FLAG;
+                skip_to_loop_end(interpreter, loop_col);
+                goto cleanup_for_loop;
+            }
+            if (interpreter->break_flag) {
+                interpreter->break_flag = 0;
+                skip_to_loop_end(interpreter, loop_col);
+                break; // Exit while(1)
+            }
+            if (interpreter->continue_flag) {
+                interpreter->continue_flag = 0;
+                // Fall through to increment step
+            }
+
+            // Increment and update loop variable
+            i_d += step_d;
+            if (i_val->type == VAL_INT && step_val->type == VAL_INT) {
+                i_val->as.integer = (long)i_d;
+            } else {
+                i_val->type = VAL_FLOAT;
+                i_val->as.floating = i_d;
+            }
         }
 
     } else if (interpreter->current_token->type == TOKEN_IN) { // Collection loop
         interpreter_eat(interpreter, TOKEN_IN);
         ExprResult coll_res = interpret_expression(interpreter);
-        Value collection_val = coll_res.value;
-        if (interpreter->exception_is_active) { free(var_name_str); free_value_contents(collection_val); interpreter->loop_depth--; return; }
+        if (interpreter->exception_is_active) {
+            if (coll_res.is_freshly_created_container) free_value_contents(coll_res.value);
+            status = STATEMENT_PROPAGATE_FLAG;
+            goto cleanup_for_loop;
+        }
+        if (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_SUSPENDED_AWAIT) {
+            if (coll_res.is_freshly_created_container) free_value_contents(coll_res.value);
+            status = STATEMENT_YIELDED_AWAIT;
+            goto cleanup_for_loop;
+        }
+        Value collection_val = coll_res.value; // Keep this for freeing if fresh
 
-        interpreter_eat(interpreter, TOKEN_COLON); // Consumes COLON. current_token is now first token of body.
-        // current_token is now the first token of the loop body.
-        // We need the LexerState corresponding to the *start* of this token.
+        // --- START: Stricter Syntax Check ---
+        int for_in_header_line = interpreter->current_token->line;
+        interpreter_eat(interpreter, TOKEN_COLON);
+        if (interpreter->current_token->line == for_in_header_line && interpreter->current_token->type != TOKEN_EOF) {
+            report_error("Syntax", "Unexpected token on the same line after 'for...in' header. Expected a newline and an indented block.", interpreter->current_token);
+        }
+        // --- END: Stricter Syntax Check ---
+
+        // current_token is now first token of body.
+        if (interpreter->current_token->col <= loop_col) report_error("Syntax", "Expected an indented block after 'for...in' statement.", loop_keyword_token_for_context);
+
         LexerState loop_body_start_lexer_state = get_lexer_state_for_token_start(interpreter->lexer,
                                                                                  interpreter->current_token->line,
                                                                                  interpreter->current_token->col,
                                                                                  interpreter->current_token);
 
-        if (collection_val.type != VAL_ARRAY && collection_val.type != VAL_STRING && collection_val.type != VAL_DICT) {
-            free(var_name_str); free_value_contents(collection_val); interpreter->loop_depth--;
-            report_error("Runtime", "Collection in 'for...in' loop must be an array, string, or dictionary.", var_name_token);
-        }
-        
-        int break_all_collection_loops = 0; // Use int for boolean flag
-        if (collection_val.type == VAL_ARRAY) {
-            Array* arr = collection_val.as.array_val;
-            if (arr->count == 0) {
-                skip_to_loop_end(interpreter, loop_col);
-                if (interpreter->exception_is_active) { interpreter->loop_depth--; free(var_name_str); free_value_contents(collection_val); return; }
-            } else {
-                for (int i = 0; i < arr->count && !break_all_collection_loops; ++i) {
-                    enter_scope(interpreter); 
-                    symbol_table_set(interpreter->current_scope, var_name_str, arr->elements[i]); 
-                    rewind_lexer_and_token(interpreter, loop_body_start_lexer_state, NULL);
-                    if (interpreter->current_token->type != TOKEN_END && interpreter->current_token->type != TOKEN_EOF && interpreter->current_token->col != body_indent) {
-                        char err_msg[300];
-                        snprintf(err_msg, sizeof(err_msg),
-                                 "First statement in 'for...in array' loop body has incorrect indentation. Expected column %d, got column %d.",
-                                 body_indent, interpreter->current_token->col);
-                        report_error("Syntax", err_msg, interpreter->current_token);
-                    }
-                    execute_loop_body_iteration(interpreter, loop_col, body_indent, "for...in array");
-                    if (interpreter->return_flag) { // Check for return_flag
-                        exit_scope(interpreter);
-                        interpreter->loop_depth--;
-                        skip_to_loop_end(interpreter, loop_col);
-                        break_all_collection_loops = 1; // Signal outer C loop to terminate
-                        // No need to free var_name_str or collection_val yet, handled after loop
-                        // but we need to ensure they are freed if we return early.
-                        goto end_for_collection_loop_label;
-                    }                    exit_scope(interpreter);
-                    if (interpreter->exception_is_active) { break_all_collection_loops = 1; /* Will be handled below */ }
-                    if (interpreter->break_flag) {
-                        // break_flag is set, the C for loop (`for (int i = 0;...`) will terminate due to `break_all_collection_loops`.
-                        // skip_to_loop_end will be called after the C for-loop.
-                        interpreter->break_flag = 0; skip_to_loop_end(interpreter, loop_col); if (interpreter->exception_is_active) {break_all_collection_loops=1;} break_all_collection_loops = 1; 
-                    }
-                    if (interpreter->continue_flag) { 
-                        interpreter->continue_flag = 0; 
-                    }
-                }
-            }
-        } else if (collection_val.type == VAL_STRING) {
-            char* str = collection_val.as.string_val;
-            if (str[0] == '\0') {
-                skip_to_loop_end(interpreter, loop_col);
-                if (interpreter->exception_is_active) { interpreter->loop_depth--; free(var_name_str); free_value_contents(collection_val); return; }
-            } else {
-                for (int i = 0; str[i] != '\0' && !break_all_collection_loops; ++i) {
-                    enter_scope(interpreter); Value char_val; char_val.type = VAL_STRING; char_val.as.string_val = malloc(2); char_val.as.string_val[0] = str[i]; char_val.as.string_val[1] = '\0';
-                    symbol_table_set(interpreter->current_scope, var_name_str, char_val); free_value_contents(char_val); // char_val copied, then original freed
-                    rewind_lexer_and_token(interpreter, loop_body_start_lexer_state, NULL);
-                    if (interpreter->current_token->type != TOKEN_END && interpreter->current_token->type != TOKEN_EOF && interpreter->current_token->col != body_indent) {
-                        char err_msg[300];
-                        snprintf(err_msg, sizeof(err_msg),
-                                 "First statement in 'for...in string' loop body has incorrect indentation. Expected column %d, got column %d.",
-                                 body_indent, interpreter->current_token->col);
-                        report_error("Syntax", err_msg, interpreter->current_token);
-                    }
-                    execute_loop_body_iteration(interpreter, loop_col, body_indent, "for...in string");
-                    if (interpreter->return_flag) {
-                        exit_scope(interpreter);
-                        interpreter->loop_depth--;
-                        skip_to_loop_end(interpreter, loop_col);
-                        break_all_collection_loops = 1;
-                        goto end_for_collection_loop_label;
+        if (collection_val.type != VAL_ARRAY && collection_val.type != VAL_STRING && collection_val.type != VAL_DICT) report_error("Runtime", "Collection in 'for...in' loop must be an array, string, or dictionary.", var_name_token);
 
-                    }
-                    exit_scope(interpreter);
-                    if (interpreter->exception_is_active) { break_all_collection_loops = 1; }
-                    if (interpreter->break_flag) { 
-                        interpreter->break_flag = 0; skip_to_loop_end(interpreter, loop_col); if (interpreter->exception_is_active) {break_all_collection_loops=1;} break_all_collection_loops = 1; 
-                    }
-                    if (interpreter->continue_flag) { 
-                        interpreter->continue_flag = 0; 
+        // Store the collection itself in a hidden variable to persist it across awaits.
+        char coll_var_name[256];
+        snprintf(coll_var_name, sizeof(coll_var_name), "__%s_coll", var_name_str);
+        bool just_resumed = (interpreter->current_executing_coroutine && interpreter->current_executing_coroutine->state == CORO_RESUMING);
+
+        symbol_table_define(interpreter->current_scope, coll_var_name, collection_val);
+        if (coll_res.is_freshly_created_container) free_value_contents(collection_val);
+
+        // Use a hidden index variable.
+        char idx_var_name[256];
+        snprintf(idx_var_name, sizeof(idx_var_name), "__%s_idx", var_name_str);
+        Value initial_idx_val = {.type = VAL_INT, .as.integer = 0};
+        symbol_table_define(interpreter->current_scope, idx_var_name, initial_idx_val);
+
+        while(1) { // Async-safe loop
+            Value* idx_ptr = symbol_table_get_local(interpreter->current_scope, idx_var_name);
+            Value* coll_ptr = symbol_table_get_local(interpreter->current_scope, coll_var_name);
+            if (!idx_ptr || !coll_ptr) report_error("Internal", "Loop state variables missing in for...in loop.", var_name_token);
+
+            if (just_resumed) {
+                DEBUG_PRINTF("FOR_LOOP (In): Resuming from await, not rewinding body lexer.%s", "");
+                just_resumed = false; // Consume the resume signal
+            }
+
+            long current_idx = idx_ptr->as.integer;
+            Value current_item;
+            bool has_more_items = false;
+
+            if (coll_ptr->type == VAL_ARRAY) {
+                if (current_idx < coll_ptr->as.array_val->count) {
+                    current_item = coll_ptr->as.array_val->elements[current_idx];
+                    has_more_items = true;
+                }
+            } else if (coll_ptr->type == VAL_STRING) {
+                if ((size_t)current_idx < strlen(coll_ptr->as.string_val)) {
+                    char* char_str = malloc(2);
+                    char_str[0] = coll_ptr->as.string_val[current_idx];
+                    char_str[1] = '\0';
+                    current_item.type = VAL_STRING;
+                    current_item.as.string_val = char_str;
+                    has_more_items = true;
+                }
+            } else if (coll_ptr->type == VAL_DICT) {
+                Dictionary* dict = coll_ptr->as.dict_val;
+                if (current_idx < dict->count) {
+                    long items_seen = 0;
+                    for (int i = 0; i < dict->num_buckets; ++i) {
+                        for (DictEntry* entry = dict->buckets[i]; entry != NULL; entry = entry->next) {
+                            if (items_seen == current_idx) {
+                                current_item.type = VAL_STRING;
+                                current_item.as.string_val = strdup(entry->key);
+                                has_more_items = true;
+                                goto found_dict_key;
+                            }
+                            items_seen++;
+                        }
                     }
                 }
+                found_dict_key:;
             }
-        } else if (collection_val.type == VAL_DICT) {
-            // Note: Dictionary iteration order is not guaranteed.
-            Dictionary* dict = collection_val.as.dict_val;
-            if (dict->count == 0) {
+
+            if (!has_more_items) {
+                break; // Exit while(1)
+            }
+
+            // Update the loop variable in the single loop scope.
+            symbol_table_set(interpreter->current_scope, var_name_str, current_item);
+            if (coll_ptr->type == VAL_STRING || coll_ptr->type == VAL_DICT) {
+                // The string/key was freshly allocated for this iteration
+                free_value_contents(current_item);
+            }
+
+            // Execute body
+            if (!just_resumed) { // The just_resumed flag has been consumed by now
+                rewind_lexer_and_token(interpreter, loop_body_start_lexer_state, NULL);
+            }
+            StatementExecStatus body_status = execute_loop_body_iteration(interpreter, loop_col, body_indent, "for...in");
+
+
+            if (body_status == STATEMENT_YIELDED_AWAIT) {
+                status = STATEMENT_YIELDED_AWAIT;
+                goto cleanup_for_loop;
+            }
+            if (interpreter->return_flag || interpreter->exception_is_active) {
+                status = STATEMENT_PROPAGATE_FLAG;
                 skip_to_loop_end(interpreter, loop_col);
-                if (interpreter->exception_is_active) { interpreter->loop_depth--; free(var_name_str); free_value_contents(collection_val); return; }
-            } else {
-                for (int bucket_idx = 0; bucket_idx < dict->num_buckets && !break_all_collection_loops; ++bucket_idx) {
-                    DictEntry* entry = dict->buckets[bucket_idx];
-                    while (entry) {
-                        enter_scope(interpreter); Value key_val; key_val.type = VAL_STRING; key_val.as.string_val = strdup(entry->key);
-                        symbol_table_set(interpreter->current_scope, var_name_str, key_val); free_value_contents(key_val); // key_val copied, then original freed
-                        rewind_lexer_and_token(interpreter, loop_body_start_lexer_state, NULL);
-                        if (interpreter->current_token->type != TOKEN_END && interpreter->current_token->type != TOKEN_EOF && interpreter->current_token->col != body_indent) {
-                            char err_msg[300];
-                            snprintf(err_msg, sizeof(err_msg),
-                                     "First statement in 'for...in dictionary' loop body has incorrect indentation. Expected column %d, got column %d.",
-                                     body_indent, interpreter->current_token->col);
-                            report_error("Syntax", err_msg, interpreter->current_token);
-                        }
-                        execute_loop_body_iteration(interpreter, loop_col, body_indent, "for...in dictionary");
-                        if (interpreter->return_flag) {
-                            exit_scope(interpreter);
-                            interpreter->loop_depth--;
-                            skip_to_loop_end(interpreter, loop_col);
-                            break_all_collection_loops = 1;
-                            entry = NULL; // Ensure inner while loop terminates
-                            goto end_for_collection_loop_label; // Break outer for loop as well
-                        }                        exit_scope(interpreter);
-                        if (interpreter->exception_is_active) { break_all_collection_loops = 1; break; }
-                        if (interpreter->break_flag) { 
-                            interpreter->break_flag = 0; skip_to_loop_end(interpreter, loop_col); if (interpreter->exception_is_active) {break_all_collection_loops=1; break;} break_all_collection_loops = 1; break; 
-                        }
-                        if (interpreter->continue_flag) { 
-                            interpreter->continue_flag = 0; 
-                        }
-                        entry = entry->next;
-                    }
-                }
+                goto cleanup_for_loop;
             }
+            if (interpreter->break_flag) {
+                interpreter->break_flag = 0;
+                skip_to_loop_end(interpreter, loop_col);
+                break; // Exit while(1)
+            }
+            if (interpreter->continue_flag) {
+                interpreter->continue_flag = 0;
+                // Fall through to increment step
+            }
+
+            // Increment index for next iteration
+            idx_ptr->as.integer++;
         }
-        end_for_collection_loop_label:;
-        if (interpreter->return_flag) { // If loop exited due to return_flag
-            if (coll_res.is_freshly_created_container) free_value_contents(collection_val);
-            free(var_name_str);
-            return; // Propagate the return (loop_depth already decremented)
-        }
-        if (coll_res.is_freshly_created_container) {
-            free_value_contents(collection_val);
-        }
-        if (break_all_collection_loops && interpreter->exception_is_active) { // Exception from body caused loop termination
-            interpreter->loop_depth--; free(var_name_str); return;
-        }
-        // If loop terminated naturally or by break, ensure we are positioned after the body
-        // skip_to_loop_end is usually called inside the break logic, but if it's a natural finish,
-        // execute_loop_body_iteration should leave us at the correct spot or this ensures it.
-        if (!interpreter->exception_is_active) skip_to_loop_end(interpreter, loop_col);
-        
     } else {
-        free(var_name_str); interpreter->loop_depth--;
         report_error("Syntax", "Expected 'from' or 'in' after 'for <variable>'.", interpreter->current_token);
     }
 
+cleanup_for_loop:
     free(var_name_str);
+    free_token(var_name_token);
     interpreter->loop_depth--;
-    if (interpreter->loop_depth == 0) { // Clear flags if this was the outermost loop
-        // If this loop was part of a coroutine that is now finishing,
-        // these flags should be local to the coroutine's execution context,
-        // or reset when a coroutine yields/completes.
-        // For now, global reset is fine for synchronous code.
-        interpreter->break_flag = 0;
-        interpreter->continue_flag = 0;
+    exit_scope(interpreter);
+    if (interpreter->loop_depth == 0) {
+        // break_flag is reset when handled. continue_flag is reset per iteration.
+        // No need to reset them here again.
     }
+    return status; // Return the overall status (could be OK or from a return)
 }
 
 static void interpret_raise_statement(Interpreter* interpreter) {
-    Token* raise_token = interpreter->current_token;
+    Token* raise_token = token_deep_copy(interpreter->current_token);
     interpreter_eat(interpreter, TOKEN_RAISE);
     interpreter_eat(interpreter, TOKEN_COLON); // Colon after 'raise'
 
@@ -1511,6 +1782,7 @@ static void interpret_raise_statement(Interpreter* interpreter) {
     Value error_val = err_val_res.value;
     if (interpreter->exception_is_active) { // If expression itself had an error
         free_value_contents(error_val); // Free partially evaluated error_val
+        free_token(raise_token);
         return; // Propagate the original error
     }
 
@@ -1521,134 +1793,140 @@ static void interpret_raise_statement(Interpreter* interpreter) {
         char err_msg[300]; // Pass interpreter to value_to_string_representation if op_str is involved
         snprintf(err_msg, sizeof(err_msg), "Can only raise a string value as an exception. Got type for value '%s'.", val_str_repr);
         free(val_str_repr);
-        free_value_contents(error_val);
+        if (err_val_res.is_freshly_created_container) free_value_contents(error_val);
         report_error("Runtime", err_msg, raise_token); // This exits
     }
 
     // Free any existing exception before setting the new one
     free_value_contents(interpreter->current_exception);
     interpreter->current_exception = value_deep_copy(error_val); // error_val is now owned by current_exception
+    if (interpreter->error_token) free_token(interpreter->error_token);
+    interpreter->error_token = token_deep_copy(raise_token);
+
     interpreter->exception_is_active = 1;
 
-    free_value_contents(error_val); // Free the original expression result as it's copied
+    if (err_val_res.is_freshly_created_container) free_value_contents(error_val); // Free the original expression result as it's copied
     DEBUG_PRINTF("RAISED EXCEPTION: %s", interpreter->current_exception.as.string_val);
+    free_token(raise_token);
 }
 
-static void interpret_try_statement(Interpreter* interpreter) {
-    Token* try_keyword_token = interpreter->current_token;
+static StatementExecStatus interpret_try_statement(Interpreter* interpreter) {
+    StatementExecStatus status = STATEMENT_EXECUTED_OK;
+    Token* try_keyword_token = token_deep_copy(interpreter->current_token);
+    bool yielded_in_block = false;
+    // Save the start state of the 'try' statement to potentially rewind to on async resume.
+    LexerState try_statement_start_state = get_lexer_state_for_token_start(
+        interpreter->lexer, try_keyword_token->line, try_keyword_token->col, try_keyword_token
+    );
+    (void)try_statement_start_state; // Suppress unused variable warning
+    
     int try_col = try_keyword_token->col;
     interpreter_eat(interpreter, TOKEN_TRY); // Consume 'try'
+
+    // --- START: Stricter Syntax Check ---
+    int try_line = try_keyword_token->line;
     interpreter_eat(interpreter, TOKEN_COLON); // Consume ':'
+    if (interpreter->current_token->line == try_line && interpreter->current_token->type != TOKEN_EOF) {
+        report_error("Syntax", "Unexpected token on the same line after 'try:'. Expected a newline and an indented block.", interpreter->current_token);
+    }
+    // --- END: Stricter Syntax Check ---
+
+    // After 'try:', the next token MUST be indented.
+    if (interpreter->current_token->col <= try_col) {
+        free_token(try_keyword_token);
+        report_error("Syntax", "Expected an indented block after 'try:' clause.", interpreter->current_token);
+    }
 
     TryCatchFrame* frame = malloc(sizeof(TryCatchFrame));
-    if (!frame) report_error("System", "Failed to allocate memory for TryCatchFrame.", try_keyword_token);
+    if (!frame) {
+        free_token(try_keyword_token);
+        report_error("System", "Failed to allocate memory for TryCatchFrame.", try_keyword_token);
+    }
+
     frame->catch_clause = NULL;
     frame->finally_present = 0;
     frame->pending_exception_after_finally = create_null_value();
     frame->pending_exception_active_after_finally = 0;
     frame->prev = interpreter->try_catch_stack_top;
     interpreter->try_catch_stack_top = frame;
+    StatementExecStatus try_block_status = STATEMENT_EXECUTED_OK;
 
-    // --- Pre-scan for catch/finally blocks and end ---
-    // This is a simplified pre-scan. A more robust one would handle nested try-catch.
-    LexerState original_lexer_state = get_lexer_state(interpreter->lexer);
-    Token* original_current_token = token_deep_copy(interpreter->current_token);
-    Token* end_token_for_try = NULL;
-    int try_nesting = 0;
+    // 1. Execute TRY block    
+    try_block_status = execute_statements_in_controlled_block(interpreter, try_col, "try", TOKEN_CATCH, TOKEN_FINALLY, TOKEN_EOF);
 
-    // Pre-scan to find catch/finally clauses and the final 'end:' for this try block
-    while(interpreter->current_token->type != TOKEN_EOF) {
-        if (interpreter->current_token->type == TOKEN_TRY) {
-            try_nesting++;
-        } else if (interpreter->current_token->type == TOKEN_END) {
-            if (try_nesting > 0) {
-                try_nesting--; // This 'end:' closes a nested 'try'
-            } else { // try_nesting == 0
-                if (interpreter->current_token->col == try_col) { // Matches current 'try' block's column
-                    end_token_for_try = token_deep_copy(interpreter->current_token);
-                    break; // Found the 'end:' for the current 'try' block
-                }
-                // If 'end' at nesting 0 but not matching try_col, it's for another structure or error.
-            }
-        } else if (try_nesting == 0 && interpreter->current_token->type == TOKEN_CATCH && interpreter->current_token->col == try_col) {
-            if (!frame->catch_clause) { // Only first catch for now
-                frame->catch_clause = malloc(sizeof(CatchClauseInfo));
-                if (!frame->catch_clause) report_error("System", "Failed to alloc CatchClauseInfo", interpreter->current_token);
-                frame->catch_clause->variable_name_present = 0;
-                frame->catch_clause->variable_name = NULL;
-                frame->catch_clause->next = NULL;
-                /* Token* catch_token = interpreter->current_token; // Marked as unused */
-                interpreter_eat(interpreter, TOKEN_CATCH); // Eat 'catch'
-                if (interpreter->current_token->type == TOKEN_AS) {
-                    interpreter_eat(interpreter, TOKEN_AS);
-                    if (interpreter->current_token->type != TOKEN_ID) report_error("Syntax", "Expected identifier after 'catch as'", interpreter->current_token);
-                    frame->catch_clause->variable_name_present = 1;
-                    frame->catch_clause->variable_name = strdup(interpreter->current_token->value);
-                    interpreter_eat(interpreter, TOKEN_ID);
-                }
-                interpreter_eat(interpreter, TOKEN_COLON); // Eat ':' after catch [as id]
-                frame->catch_clause->body_start_state = get_lexer_state_for_token_start(interpreter->lexer, interpreter->current_token->line, interpreter->current_token->col, interpreter->current_token);
-                continue; // Continue scan from after catch clause header
-            }
-        } else if (try_nesting == 0 && interpreter->current_token->type == TOKEN_FINALLY && interpreter->current_token->col == try_col) {
-            frame->finally_present = 1;
-            interpreter_eat(interpreter, TOKEN_FINALLY); // Eat 'finally'
-            interpreter_eat(interpreter, TOKEN_COLON);   // Eat ':'
-            frame->finally_body_start_state = get_lexer_state_for_token_start(interpreter->lexer, interpreter->current_token->line, interpreter->current_token->col, interpreter->current_token);
-            continue; // Continue scan
-        }
-        Token* temp_tok = interpreter->current_token;
-        interpreter->current_token = get_next_token(interpreter->lexer);
-        free_token(temp_tok);
+    if (try_block_status == STATEMENT_YIELDED_AWAIT) {
+        free_token(try_keyword_token);
+        return STATEMENT_YIELDED_AWAIT;
     }
-    if (!end_token_for_try) report_error("Syntax", "Missing 'end:' for 'try' statement.", try_keyword_token);
-    free_token(end_token_for_try); // We just needed to confirm its existence and position.
 
-    // Restore lexer to start of try body
-    set_lexer_state(interpreter->lexer, original_lexer_state);
-    free_token(interpreter->current_token);
-    interpreter->current_token = original_current_token;
-    // --- End Pre-scan ---
-
-    // 1. Execute TRY block
-    int old_in_tcf_block_def = interpreter->in_try_catch_finally_block_definition;
-    interpreter->in_try_catch_finally_block_definition = 1;
-    // Statements in try block are indented by try_col + 4
-    execute_statements_in_controlled_block(interpreter, try_col + 4, "try", TOKEN_CATCH, TOKEN_FINALLY, TOKEN_END);
-    interpreter->in_try_catch_finally_block_definition = old_in_tcf_block_def;
-    // Store if an exception occurred in try or was already propagating
     int exception_occurred_in_try = interpreter->exception_is_active;
     Value exception_from_try = create_null_value();
+
     if (exception_occurred_in_try) {
         exception_from_try = value_deep_copy(interpreter->current_exception);
     }
 
+    bool has_catch_or_finally = false;
+
     // 2. Execute CATCH block (if an exception occurred and catch exists)
-    if (exception_occurred_in_try && frame->catch_clause) {
-        interpreter->exception_is_active = 0; // Exception is "caught" for now
-        free_value_contents(interpreter->current_exception);
-        interpreter->current_exception = create_null_value();
-
-        rewind_lexer_and_token(interpreter, frame->catch_clause->body_start_state, NULL);
-        enter_scope(interpreter); // Scope for catch block
-        if (frame->catch_clause->variable_name_present) {
-            symbol_table_set(interpreter->current_scope, frame->catch_clause->variable_name, exception_from_try);
+    if (interpreter->current_token->type == TOKEN_CATCH && interpreter->current_token->col == try_col) {
+        has_catch_or_finally = true;
+        // Parse catch clause header
+        interpreter_eat(interpreter, TOKEN_CATCH);
+        frame->catch_clause = malloc(sizeof(CatchClauseInfo));
+        frame->catch_clause->variable_name = NULL;
+        frame->catch_clause->variable_name_present = 0;
+        if (interpreter->current_token->type == TOKEN_AS) {
+            interpreter_eat(interpreter, TOKEN_AS);
+            if (interpreter->current_token->type != TOKEN_ID) report_error("Syntax", "Expected identifier after 'catch as'", interpreter->current_token);
+            frame->catch_clause->variable_name = strdup(interpreter->current_token->value);
+            frame->catch_clause->variable_name_present = 1;
+            interpreter_eat(interpreter, TOKEN_ID);
         }
-        old_in_tcf_block_def = interpreter->in_try_catch_finally_block_definition;
-        interpreter->in_try_catch_finally_block_definition = 1;
-        execute_statements_in_controlled_block(interpreter, try_col + 4, "catch", TOKEN_FINALLY, TOKEN_END, TOKEN_END); // Catch ends at finally or end
-        interpreter->in_try_catch_finally_block_definition = old_in_tcf_block_def;
 
-        exit_scope(interpreter); // Exit catch block scope
-        // If catch block raised a new exception, interpreter->exception_is_active will be true.
-        // The original exception_from_try is considered handled by this catch.
-        exception_occurred_in_try = interpreter->exception_is_active; // Update based on catch block's outcome
-        if (exception_occurred_in_try) { // If catch re-raised or raised new
-            free_value_contents(exception_from_try); // Free the original try exception
-            exception_from_try = value_deep_copy(interpreter->current_exception); // Store the new one
-        } else {
-            free_value_contents(exception_from_try); // Original try exception was handled
-            exception_from_try = create_null_value();
+        // --- START: Stricter Syntax Check ---
+        int catch_header_line = interpreter->current_token->line;
+        interpreter_eat(interpreter, TOKEN_COLON);
+        if (interpreter->current_token->line == catch_header_line && interpreter->current_token->type != TOKEN_EOF) {
+            report_error("Syntax", "Unexpected token on the same line after 'catch' clause. Expected a newline and an indented block.", interpreter->current_token);
+        }
+        // --- END: Stricter Syntax Check ---
+
+        // After 'catch...:', the next token MUST be indented.
+        if (interpreter->current_token->col <= try_col) {
+            free_value_contents(exception_from_try);
+            free_token(try_keyword_token);
+            report_error("Syntax", "Expected an indented block after 'catch' clause.", interpreter->current_token);
+        }
+
+        if (exception_occurred_in_try && !yielded_in_block) { // Only execute catch body
+            interpreter->exception_is_active = 0; // Exception is "caught" for now
+            free_value_contents(interpreter->current_exception);
+            interpreter->current_exception = create_null_value();
+
+            enter_scope(interpreter); // Scope for catch block
+            if (frame->catch_clause->variable_name_present) {
+                symbol_table_set(interpreter->current_scope, frame->catch_clause->variable_name, exception_from_try);
+            }
+
+            StatementExecStatus catch_block_status = execute_statements_in_controlled_block(interpreter, try_col, "catch", TOKEN_FINALLY, TOKEN_EOF, TOKEN_EOF);
+            if (catch_block_status == STATEMENT_YIELDED_AWAIT) { // A yield happened inside the catch block
+                yielded_in_block = true;
+            }
+
+            exit_scope(interpreter); // Exit catch block scope
+            // If catch block raised a new exception, interpreter->exception_is_active will be true.
+            // The original exception_from_try is considered handled by this catch.
+            exception_occurred_in_try = interpreter->exception_is_active; // Update based on catch block's outcome
+            if (exception_occurred_in_try) { // If catch re-raised or raised new
+                free_value_contents(exception_from_try); // Free the original try exception
+                exception_from_try = value_deep_copy(interpreter->current_exception); // Store the new one
+                } else { // Original try exception was handled
+                    free_value_contents(exception_from_try);
+                    exception_from_try = create_null_value();
+                }
+        } else { // No exception occurred or we yielded, so skip the catch block body
+            skip_statements_in_branch(interpreter, try_col);
         }
     } else if (exception_occurred_in_try) {
         // Exception occurred in try, but no catch clause. It remains active.
@@ -1656,28 +1934,66 @@ static void interpret_try_statement(Interpreter* interpreter) {
     }
 
     // 3. Execute FINALLY block (if present)
-    if (frame->finally_present) {
-        // Save current exception state (which might be from try or catch)
-        frame->pending_exception_after_finally = value_deep_copy(exception_from_try);
-        frame->pending_exception_active_after_finally = exception_occurred_in_try;
+    if (interpreter->current_token->type == TOKEN_FINALLY && interpreter->current_token->col == try_col) {
+        has_catch_or_finally = true;
+        int finally_line = interpreter->current_token->line;
+        interpreter_eat(interpreter, TOKEN_FINALLY);
+        interpreter_eat(interpreter, TOKEN_COLON);
 
+        // --- START: Stricter Syntax Check ---
+        if (interpreter->current_token->line == finally_line && interpreter->current_token->type != TOKEN_EOF) {
+            report_error("Syntax", "Unexpected token on the same line after 'finally:'. Expected a newline and an indented block.", interpreter->current_token);
+        }
+        // --- END: Stricter Syntax Check ---
+
+        // After 'finally:', the next token MUST be indented.
+        if (interpreter->current_token->col <= try_col) {
+            report_error("Syntax", "Expected an indented block after 'finally:' clause.", try_keyword_token);
+        }
+
+        // FIX 2: Save ALL pending control flow states
+        Value pending_exception = value_deep_copy(exception_from_try);
+        int pending_exception_is_active = exception_occurred_in_try;
+
+        Value pending_return_value = create_null_value();
+        int pending_return_flag = interpreter->return_flag;
+        if (pending_return_flag) {
+            pending_return_value = value_deep_copy(interpreter->current_function_return_value);
+        }
+
+        int pending_break_flag = interpreter->break_flag;
+        int pending_continue_flag = interpreter->continue_flag;
+
+        // Temporarily clear flags for finally execution
         interpreter->exception_is_active = 0; // Temporarily clear for finally execution
         free_value_contents(interpreter->current_exception);
         interpreter->current_exception = create_null_value();
-
-        rewind_lexer_and_token(interpreter, frame->finally_body_start_state, NULL);
-        old_in_tcf_block_def = interpreter->in_try_catch_finally_block_definition;
-        interpreter->in_try_catch_finally_block_definition = 1;
-        execute_statements_in_controlled_block(interpreter, try_col + 4, "finally", TOKEN_END, TOKEN_END, TOKEN_END); // Finally ends at 'end:'
-        interpreter->in_try_catch_finally_block_definition = old_in_tcf_block_def;
+        interpreter->return_flag = 0;
+        free_value_contents(interpreter->current_function_return_value);
+        interpreter->current_function_return_value = create_null_value();
+        interpreter->break_flag = 0;
+        interpreter->continue_flag = 0;
         
-        if (interpreter->exception_is_active) { // If finally raised its own exception
-            free_value_contents(frame->pending_exception_after_finally); // Original/catch exception is superseded
+        StatementExecStatus finally_block_status = execute_statements_in_controlled_block(interpreter, try_col, "finally", TOKEN_EOF, TOKEN_EOF, TOKEN_EOF);
+        if (finally_block_status == STATEMENT_YIELDED_AWAIT) { // A yield happened inside the finally block
+            yielded_in_block = true;
+        }
+        
+        if (interpreter->exception_is_active || interpreter->return_flag || interpreter->break_flag || interpreter->continue_flag) { // If finally raised its own exception or control flow change
+            free_value_contents(pending_exception); // Original/catch exception is superseded
+            free_value_contents(pending_return_value); // Any pending return is also superseded
             // The new exception from finally is already in interpreter->current_exception and active.
         } else { // Finally completed without new exception, restore pending one
-            interpreter->current_exception = value_deep_copy(frame->pending_exception_after_finally);
-            interpreter->exception_is_active = frame->pending_exception_active_after_finally;
-            free_value_contents(frame->pending_exception_after_finally);
+            interpreter->current_exception = value_deep_copy(pending_exception);
+            interpreter->exception_is_active = pending_exception_is_active;
+            free_value_contents(pending_exception);
+
+            interpreter->current_function_return_value = value_deep_copy(pending_return_value);
+            interpreter->return_flag = pending_return_flag;
+            free_value_contents(pending_return_value);
+
+            interpreter->break_flag = pending_break_flag;
+            interpreter->continue_flag = pending_continue_flag;
         }
     } else if (exception_occurred_in_try) { // No finally, but an exception is still active
         free_value_contents(interpreter->current_exception);
@@ -1686,24 +2002,9 @@ static void interpret_try_statement(Interpreter* interpreter) {
     }
     free_value_contents(exception_from_try);
 
-    // Skip to the 'end:' token of the try-catch-finally block
-    // The execute_statements_in_controlled_block should leave current_token on CATCH, FINALLY, or END
-    // We need to ensure we are at the correct 'end:'
-    while(interpreter->current_token->type != TOKEN_EOF &&
-          !(interpreter->current_token->type == TOKEN_END && interpreter->current_token->col == try_col)) {
-        Token* temp_tok = interpreter->current_token;
-        interpreter->current_token = get_next_token(interpreter->lexer);
-        free_token(temp_tok);
+    if (!has_catch_or_finally) {
+        report_error("Syntax", "'try' statement must be followed by at least one 'catch' or 'finally' clause.", try_keyword_token);
     }
-
-    if (interpreter->current_token->type == TOKEN_END && interpreter->current_token->col == try_col) {
-        interpreter_eat(interpreter, TOKEN_END);
-        interpreter_eat(interpreter, TOKEN_COLON);
-    } else {
-        // This should have been caught by pre-scan or means something went wrong during execution
-        report_error("Syntax", "Could not find matching 'end:' for 'try' statement after execution.", try_keyword_token);
-    }
-
     // Pop the frame
     interpreter->try_catch_stack_top = frame->prev;
     if (frame->catch_clause) {
@@ -1711,13 +2012,30 @@ static void interpret_try_statement(Interpreter* interpreter) {
         free(frame->catch_clause);
     }
     free(frame);
+    free_token(try_keyword_token);
 
-    // Exception, if still active, will propagate upwards.
+    if (yielded_in_block) {
+        return STATEMENT_YIELDED_AWAIT;
+    }
+
+    if (interpreter->exception_is_active || interpreter->return_flag) { // If exception or return is active after try-catch-finally
+        return STATEMENT_PROPAGATE_FLAG;
+    }
+    return status;
+}
+
+static bool is_builtin_module(const char* module_name) {
+    if (!module_name) return false;
+    // For now, only 'weaver' is built-in. This can be expanded later.
+    if (strcmp(module_name, "weaver") == 0) {
+        return true;
+    }
+    return false;
 }
 
 static void interpret_blueprint_statement(Interpreter* interpreter) {
-    Token* blueprint_keyword_token = interpreter->current_token;
-    int blueprint_def_col = blueprint_keyword_token->col;
+    Token* blueprint_keyword_token = token_deep_copy(interpreter->current_token);
+    int blueprint_def_col = blueprint_keyword_token->col; // This is now safe
     interpreter_eat(interpreter, TOKEN_BLUEPRINT); // Consume 'blueprint'
     interpreter_eat(interpreter, TOKEN_COLON); // Consume ':'
 
@@ -1739,6 +2057,7 @@ static void interpret_blueprint_statement(Interpreter* interpreter) {
     new_bp->parent_blueprint = NULL;
     new_bp->init_method_cache = NULL;
 
+    new_bp->definition_col = blueprint_def_col; // Use the saved int, which is safer
     new_bp->class_attributes_and_methods = malloc(sizeof(Scope));
     if (!new_bp->class_attributes_and_methods) {
         free(new_bp->name); free(new_bp); free_token(bp_name_token);
@@ -1770,81 +2089,22 @@ static void interpret_blueprint_statement(Interpreter* interpreter) {
         interpreter_eat(interpreter, TOKEN_ID);
     }
 
-    interpreter_eat(interpreter, TOKEN_COLON); // Colon after name [inherits Parent]
-
-    // --- Pre-scan for 'end:' to correctly handle function body skipping ---
-    // This is crucial because 'funct' definitions inside blueprints also use 'end:'
-    LexerState state_before_prescan = get_lexer_state(interpreter->lexer);
-    Token* token_to_restore_after_prescan = token_deep_copy(interpreter->current_token);
-
-    int bp_nesting_level = 0;
-    Token* found_bp_end_token_info = NULL;
-    Token* last_token_of_scan = NULL;
-    while(interpreter->current_token->type != TOKEN_EOF) {
-        DEBUG_PRINTF("Blueprint Pre-scan for '%s': Token %s ('%s') at L%d C%d, Nesting: %d, TargetCol: %d",
-            new_bp->name ? new_bp->name : "<NULL_BP_NAME>",
-            token_type_to_string(interpreter->current_token->type),
-            interpreter->current_token->value ? interpreter->current_token->value : "",
-            interpreter->current_token->line, interpreter->current_token->col,
-            bp_nesting_level, blueprint_def_col);        
-        if (interpreter->current_token->type == TOKEN_FUNCT || // funct inside blueprint
-            interpreter->current_token->type == TOKEN_IF ||
-            interpreter->current_token->type == TOKEN_LOOP ||
-            interpreter->current_token->type == TOKEN_TRY) {
-            bp_nesting_level++;
-        } else if (interpreter->current_token->type == TOKEN_END) {
-            if (bp_nesting_level == 0 && interpreter->current_token->col == blueprint_def_col) {
-                found_bp_end_token_info = token_deep_copy(interpreter->current_token);
-                last_token_of_scan = interpreter->current_token; // END token itself
-                break;
-            }
-            if (bp_nesting_level > 0) bp_nesting_level--;
-        }
-        Token* temp_tok = interpreter->current_token;
-        interpreter->current_token = get_next_token(interpreter->lexer);
-        free_token(temp_tok);
+    // --- START: Stricter Syntax Check ---
+    int blueprint_header_line = interpreter->current_token->line;
+    interpreter_eat(interpreter, TOKEN_COLON);
+    if (interpreter->current_token->line == blueprint_header_line && interpreter->current_token->type != TOKEN_EOF) {
+        report_error("Syntax", "Unexpected token on the same line after blueprint signature. Expected a newline and an indented block.", interpreter->current_token);
     }
-    if (!found_bp_end_token_info) { // Loop terminated by EOF
-        last_token_of_scan = interpreter->current_token; // EOF token
+    if (interpreter->current_token->col <= blueprint_def_col) {
+        report_error("Syntax", "Expected an indented block after 'blueprint' signature.", interpreter->current_token);
     }
-
-    // Restore interpreter's lexer and current_token to their state *before* the pre-scan.
-    set_lexer_state(interpreter->lexer, state_before_prescan);
-    free_token(last_token_of_scan); // Free the token that was live at the end of the scan (END or EOF)
-    interpreter->current_token = token_to_restore_after_prescan; // Assign the deep copied token back.
-
-    if (!found_bp_end_token_info) {
-        char err_msg[256];
-        // Use bp_name_token->value for the error message as new_bp->name (bp_name_str) will be freed.
-        snprintf(err_msg, sizeof(err_msg), "Unclosed blueprint definition for '%s'. Missing 'end:' aligned at column %d?",
-                 bp_name_token->value, blueprint_def_col);
-
-        // Cleanup blueprint resources
-        free(new_bp->name); // new_bp->name is bp_name_str
-        if (new_bp->class_attributes_and_methods) free_scope(new_bp->class_attributes_and_methods);
-        free(new_bp);
-        free_token(bp_name_token); // Free the copied name token
-
-        // interpreter->current_token is already restored
-        report_error("Syntax", err_msg, interpreter->current_token); // Report error with restored token context
-    }
-
-    int end_bp_line = found_bp_end_token_info->line;
-    int end_bp_col = found_bp_end_token_info->col;
-    free_token(found_bp_end_token_info);
-
-    // Lexer and current_token are already restored to the start of the blueprint body.
-
-    // --- End Pre-scan ---
+    // --- END: Stricter Syntax Check ---
 
     // Process blueprint body (class attributes and methods)
     Scope* old_scope = interpreter->current_scope;
     interpreter->current_scope = new_bp->class_attributes_and_methods; // Set scope for 'let' and 'funct' inside blueprint
 
-    while (!(interpreter->current_token->type == TOKEN_END &&
-             interpreter->current_token->line == end_bp_line &&
-             interpreter->current_token->col == end_bp_col) &&
-           interpreter->current_token->type != TOKEN_EOF) {
+    while (interpreter->current_token->type != TOKEN_EOF && interpreter->current_token->col > blueprint_def_col) {
 
         if (interpreter->current_token->col != blueprint_def_col + 4 && interpreter->current_token->type != TOKEN_EOF) {
              char err_msg[300]; snprintf(err_msg, sizeof(err_msg), "Statement in blueprint '%s' has incorrect indentation. Expected col %d, got %d.", new_bp->name, blueprint_def_col + 4, interpreter->current_token->col);
@@ -1868,9 +2128,6 @@ static void interpret_blueprint_statement(Interpreter* interpreter) {
     }
     interpreter->current_scope = old_scope; // Restore original scope
 
-    interpreter_eat(interpreter, TOKEN_END); // Eat the blueprint's 'end'
-    interpreter_eat(interpreter, TOKEN_COLON);
-
     Value bp_val; bp_val.type = VAL_BLUEPRINT; bp_val.as.blueprint_val = new_bp;
     symbol_table_set(interpreter->current_scope, new_bp->name, bp_val); // Store blueprint in the outer scope
 
@@ -1883,6 +2140,7 @@ static void interpret_blueprint_statement(Interpreter* interpreter) {
 
     // bp_val (and new_bp) is now owned by the symbol table.
     free_token(bp_name_token);
+    free_token(blueprint_keyword_token); // Free the deep copy we made
 }
 
 static void interpret_load_statement(Interpreter* interpreter) {
@@ -1891,58 +2149,51 @@ static void interpret_load_statement(Interpreter* interpreter) {
     interpreter_eat(interpreter, TOKEN_COLON); // Consume ':'
 
     do {
-        if (interpreter->current_token->type == TOKEN_ID) { // Form 1: load: module [as alias]
-            // Form 1: load: module_ident_or_string [as alias]
-            if (interpreter->current_token->type == TOKEN_ID || interpreter->current_token->type == TOKEN_STRING) {
-                char* module_source_identifier_str = strdup(interpreter->current_token->value);
-                Token* module_source_token = token_deep_copy(interpreter->current_token);
-                interpreter_eat(interpreter, interpreter->current_token->type); // Eat ID or STRING
+        // These variables must be local to each iteration of the load statement
+        char* module_source_identifier_str = NULL;
+        bool explicit_as_keyword_used = false;
+        char* alias_str = NULL;
 
-                char* alias_str = NULL; // Initialize to NULL
-                bool explicit_as_keyword_used = false;
+        if (interpreter->current_token->type == TOKEN_ID || interpreter->current_token->type == TOKEN_STRING) { // Form 1: load: module [as alias]
+            module_source_identifier_str = strdup(interpreter->current_token->value);
+            Token* module_source_token = token_deep_copy(interpreter->current_token);
+            interpreter_eat(interpreter, interpreter->current_token->type); // Eat ID or STRING
 
-                if (interpreter->current_token->type == TOKEN_AS) {
-                    explicit_as_keyword_used = true;
-                    interpreter_eat(interpreter, TOKEN_AS);
-                    if (interpreter->current_token->type != TOKEN_ID) {
-                        free(module_source_identifier_str);
-                        free_token(module_source_token);
-                        report_error("Syntax", "Expected alias name after 'as' in load statement.", interpreter->current_token);
-                    }
-                    alias_str = strdup(interpreter->current_token->value);
-                    interpreter_eat(interpreter, TOKEN_ID);
+            if (interpreter->current_token->type == TOKEN_AS) {
+                explicit_as_keyword_used = true;
+                interpreter_eat(interpreter, TOKEN_AS);
+                if (interpreter->current_token->type != TOKEN_ID) {
+                    free(module_source_identifier_str);
+                    free_token(module_source_token);
+                    report_error("Syntax", "Expected alias name after 'as' in load statement.", interpreter->current_token);
                 }
-
+                alias_str = strdup(interpreter->current_token->value);
+                interpreter_eat(interpreter, TOKEN_ID);
+            }
+            
+            Value module_namespace_dict;
+            bool is_builtin = is_builtin_module(module_source_identifier_str);
+            if (is_builtin) {
+                module_namespace_dict = get_or_create_builtin_module(interpreter, module_source_identifier_str, module_source_token);
+            } else {
                 char* abs_path = resolve_module_path(interpreter, module_source_identifier_str, module_source_token);
-                if (abs_path) {
-                    Value module_namespace_dict = load_module_from_path(interpreter, abs_path, module_source_token); // VAL_DICT
+                module_namespace_dict = load_module_from_path(interpreter, abs_path, module_source_token);
+                free(abs_path);
+            }
 
-                    if (explicit_as_keyword_used) {
-                        // Load module into an alias (namespace)
-                        symbol_table_set(interpreter->current_scope, alias_str, module_namespace_dict);
-                    } else {
-                        // No 'as', so import all into current scope
-                        if (module_namespace_dict.type == VAL_DICT) {
-                            Dictionary* exports = module_namespace_dict.as.dict_val;
-                            for (int i = 0; i < exports->num_buckets; ++i) {
-                                DictEntry* entry = exports->buckets[i];
-                                while (entry) {
-                                    symbol_table_set(interpreter->current_scope, entry->key, entry->value);
-                                    entry = entry->next;
-                                }
-                            }
-                        } else {
-                            report_error("Internal", "Module did not return a dictionary of exports.", module_source_token);
-                        }
-                    }
-                    free_value_contents(module_namespace_dict);
-                    free(abs_path);
-                }
-                // Cleanup
-                free(module_source_identifier_str);
-                free_token(module_source_token);
-                if (alias_str) free(alias_str);
-            }  // <-- Added missing closing brace for the TOKEN_ID branch
+            if (explicit_as_keyword_used) {
+                symbol_table_set(interpreter->current_scope, alias_str, module_namespace_dict);
+            } else {
+                // If no 'as' alias is provided, use the module's own name as the variable name.
+                symbol_table_set(interpreter->current_scope, module_source_identifier_str, module_namespace_dict);
+            }
+
+            // Cleanup for this iteration
+            free_value_contents(module_namespace_dict);
+            free(module_source_identifier_str);
+            free_token(module_source_token);
+            if (alias_str) free(alias_str);
+
         } else if (interpreter->current_token->type == TOKEN_LPAREN) { // Form 2: load: (items) from module
             interpreter_eat(interpreter, TOKEN_LPAREN);
             // For simplicity, let's assume a fixed max number of items to import for now
@@ -1992,19 +2243,22 @@ static void interpret_load_statement(Interpreter* interpreter) {
                 report_error("Syntax", "Expected module name (identifier or string path) after 'from' in load statement.", interpreter->current_token);
             }
 
-            char* abs_path = resolve_module_path(interpreter, module_name_or_path_str, module_origin_token);
-            if (abs_path) {
-                Value module_namespace = load_module_from_path(interpreter, abs_path, module_origin_token); // VAL_DICT
-                for (int i = 0; i < item_count; ++i) {
-                    // dictionary_get returns a deep copy or reports an error if not found.
-                    Value item_val = dictionary_get(module_namespace.as.dict_val, item_names[i], module_origin_token);
-                    symbol_table_set(interpreter->current_scope, item_aliases[i], item_val);
-                    // free the copy from dictionary_get, as symbol_table_set makes its own deep copy.
-                    free_value_contents(item_val);
-                }
-                free_value_contents(module_namespace); // Free the module namespace dict itself
+            Value module_namespace;
+            if (is_builtin_module(module_name_or_path_str)) {
+                module_namespace = get_or_create_builtin_module(interpreter, module_name_or_path_str, module_origin_token);
+            } else {
+                char* abs_path = resolve_module_path(interpreter, module_name_or_path_str, module_origin_token);
+                module_namespace = load_module_from_path(interpreter, abs_path, module_origin_token);
                 free(abs_path);
             }
+
+            for (int i = 0; i < item_count; ++i) {
+                Value item_val = dictionary_get(module_namespace.as.dict_val, item_names[i], module_origin_token);
+                symbol_table_set(interpreter->current_scope, item_aliases[i], item_val);
+                free_value_contents(item_val);
+            }
+            free_value_contents(module_namespace);
+
             for (int i = 0; i < item_count; ++i) {
                 if (item_aliases[i] != item_names[i])
                     free(item_aliases[i]);
@@ -2024,58 +2278,133 @@ static void interpret_load_statement(Interpreter* interpreter) {
     interpreter_eat(interpreter, TOKEN_COLON); // Final colon for the load statement
 }
 
-static void interpret_run_statement(Interpreter* interpreter) {
-    interpreter_eat(interpreter, TOKEN_RUN);
-    interpreter_eat(interpreter, TOKEN_COLON);
-    // Changed from interpret_ternary_expr to interpret_expression
-    ExprResult coro_expr_res = interpret_expression(interpreter); // Should evaluate to a coroutine
-    if (interpreter->exception_is_active) {
-        free_value_contents(coro_expr_res.value);
-        return;
-    }
-    Value coro_val = coro_expr_res.value; // Keep a handle to it
+// Executes the body of an EchoC-defined coroutine.
+// This function is called by the event loop when a coroutine is scheduled to run.
+StatementExecStatus interpret_coroutine_body(Interpreter* interpreter, Coroutine* coro_to_run) {
+    Scope* old_scope = interpreter->current_scope;
 
-    if (coro_expr_res.value.type != VAL_COROUTINE) {
-        if (coro_expr_res.is_freshly_created_container) free_value_contents(coro_val);
-        report_error("Runtime", "'run:' expects a coroutine to execute.", interpreter->current_token);
-    }
+    Object* old_self_obj_ctx = interpreter->current_self_object;
+    LexerState old_lexer_state = get_lexer_state(interpreter->lexer);
+    Token* old_current_token = token_deep_copy(interpreter->current_token);
     
-    Coroutine* initial_coro = coro_expr_res.value.as.coroutine_val;
+    // --- START of changes for coroutine-specific try-catch stack ---
+    TryCatchFrame* old_try_catch_stack = interpreter->try_catch_stack_top;
+    interpreter->try_catch_stack_top = coro_to_run->try_catch_stack_top;
+    // --- END of changes for coroutine-specific try-catch stack ---
 
-    // If the coroutine came from an expression like `run: some_func_that_returns_a_coro():`
-    // and `some_func_that_returns_a_coro` itself was async, it needs arguments set up.
-    // This is complex. For now, assume `run:` takes a direct async function call like `run: my_async_func(arg1):`
-    // In this case, `interpret_any_function_call` (called by `interpret_ternary_expr`)
-    // would have created the coroutine and set up its initial scope with arguments if it's an EchoC async func.
-
-    if (initial_coro->function_def && initial_coro->state == CORO_NEW && initial_coro->execution_scope == NULL) {
-        // This implies it's an EchoC async function called directly by run:
-        // Its arguments should have been parsed by interpret_any_function_call.
-        // The initial scope with arguments needs to be associated here.
-        // This part is tricky because interpret_ternary_expr doesn't easily pass back the argument scope.
-        // For now, let's assume if it's an EchoC func, its scope is set up during creation.
-        // If it's a C-created coroutine (like async_sleep), execution_scope is NULL.
+    // Set up interpreter context for this coroutine
+    interpreter->current_scope = coro_to_run->execution_scope;
+    // If resuming from an await, we use the more precise post_await_resume_state.
+    // Otherwise (e.g., first run, or after a different kind of yield if introduced later),
+    // we use the general statement_resume_state.
+    if (coro_to_run->has_yielding_await_state) {
+        interpreter->prevent_side_effects = true;
+        DEBUG_PRINTF("CORO_BODY_EXEC: Resuming coro '%s'. Fast-forward mode ENABLED.", coro_to_run->name ? coro_to_run->name : "unnamed");
     }
 
-    if (initial_coro->state != CORO_NEW) {
-        if (coro_expr_res.is_freshly_created_container) free_value_contents(coro_val);
-        report_error("Runtime", "Coroutine passed to 'run:' has already been started or completed.", interpreter->current_token);
+    DEBUG_PRINTF("CORO_BODY_EXEC: Resuming coro '%s'. ALWAYS resuming from STATEMENT_RESUME state: Pos=%d, Line=%d, Col=%d", coro_to_run->name ? coro_to_run->name : "unnamed", coro_to_run->statement_resume_state.pos, coro_to_run->statement_resume_state.line, coro_to_run->statement_resume_state.col);
+    // ALWAYS resume from the start of the statement that yielded.
+    // The 'await' expression handler will detect it's a resume and fast-forward the expression parsing.
+    set_lexer_state(interpreter->lexer, coro_to_run->statement_resume_state); 
+
+    interpreter->current_self_object = NULL; // Coroutines are not methods in the OOP sense here
+
+    interpreter->function_nesting_level++; // Increment nesting level for the coroutine's execution
+
+    free_token(interpreter->current_token); 
+    interpreter->current_token = get_next_token(interpreter->lexer); 
+
+    interpreter->current_executing_coroutine = coro_to_run; // Set context AFTER setting up lexer
+    interpreter->return_flag = 0; // Reset for this coroutine execution slice
+
+    DEBUG_PRINTF("CORO_BODY_EXEC: Starting/Resuming coro %s (%p). Scope: %p. Lexer state: Pos=%d, Line=%d, Col=%d. Token: %s ('%s')",
+                 coro_to_run->name ? coro_to_run->name : "unnamed", (void*)coro_to_run,
+                 (void*)interpreter->current_scope,
+                 interpreter->lexer->pos, interpreter->lexer->line, interpreter->lexer->col,
+                 token_type_to_string(interpreter->current_token->type),
+                 interpreter->current_token->value ? interpreter->current_token->value : "N/A");
+
+    if (!coro_to_run->function_def) {
+        report_error("Internal", "interpret_coroutine_body called on coroutine with no function_def.", interpreter->current_token);
+        goto cleanup_and_return_coro_body; // Use goto for cleanup path
     }
-    if (initial_coro->is_cancelled) {
-        if (coro_expr_res.is_freshly_created_container) free_value_contents(coro_val);
-        report_error("Runtime", "Cannot 'run:' a coroutine that has already been cancelled.", interpreter->current_token);
+
+    bool returned = false;
+
+    while (true) {
+        // Check for function end condition BEFORE executing a statement
+        if ((interpreter->current_token->col <= coro_to_run->function_def->definition_col &&
+             interpreter->current_token->type != TOKEN_EOF) ||
+            interpreter->current_token->type == TOKEN_EOF)
+        {
+            // Natural completion of the coroutine body.
+            coro_to_run->state = CORO_DONE;
+            free_value_contents(coro_to_run->result_value);
+            coro_to_run->result_value = create_null_value(); // Implicit return of null.
+            break; // Exit the while loop
+        }
+
+		// Save resume state BEFORE executing the statement.
+		if (coro_to_run) {
+			coro_to_run->statement_resume_state = get_lexer_state_for_token_start(interpreter->lexer, interpreter->current_token->line, interpreter->current_token->col, interpreter->current_token);
+		}
+
+        DEBUG_PRINTF("CORO_BODY_EXEC: About to interpret statement. Token: %s ('%s') at L%d C%d",
+             token_type_to_string(interpreter->current_token->type),
+             interpreter->current_token->value ? interpreter->current_token->value : "N/A",
+             interpreter->current_token->line, interpreter->current_token->col);
+        StatementExecStatus status = interpret_statement(interpreter);
+
+        if (status == STATEMENT_YIELDED_AWAIT) {
+            // The coroutine yielded. Its state is set to SUSPENDED by await.
+            // We need to break out of this execution loop. The resume state is already saved.
+            break;
+        } else if (status == STATEMENT_PROPAGATE_FLAG) {
+            // A 'return' or 'raise' occurred.
+            if (interpreter->return_flag) {
+                returned = true;
+                coro_to_run->state = CORO_DONE;
+                free_value_contents(coro_to_run->result_value);
+                coro_to_run->result_value = value_deep_copy(interpreter->current_function_return_value);
+                interpreter->return_flag = 0;
+            } else if (interpreter->exception_is_active) {
+                coro_to_run->state = CORO_DONE;
+                coro_to_run->has_exception = 1;
+                free_value_contents(coro_to_run->exception_value);
+                coro_to_run->exception_value = value_deep_copy(interpreter->current_exception);
+                interpreter->exception_is_active = 0;
+                free_value_contents(interpreter->current_exception);
+                interpreter->current_exception = create_null_value();
+            }
+            break; // Exit the while loop
+        }
     }
-    initial_coro->state = CORO_RUNNABLE;
-    add_to_ready_queue(interpreter, initial_coro); // add_to_ready_queue is now in interpreter.c
-    
-    run_event_loop(interpreter); // This will execute queued coroutines
-    // The coro_val (VAL_COROUTINE) and its underlying Coroutine* are now managed by the async system.
-    // Do not free coro_val here if it was fresh, as its pointer is in the queue.
-    // The `run:` statement should end with a colon.
-    // `interpret_ternary_expr` would have consumed tokens up to the colon.
-    if (interpreter->current_token->type == TOKEN_COLON) {
-        interpreter_eat(interpreter, TOKEN_COLON);
-    } else {
-        report_error_unexpected_token(interpreter, "':' to end 'run:' statement");
+
+    // After the loop, if it exited due to a return, check for unreachable code.
+    if (returned) {
+        if (interpreter->current_token->type != TOKEN_EOF && interpreter->current_token->col > coro_to_run->function_def->definition_col) {
+            report_error("Syntax", "Unreachable code after 'return:' statement.", interpreter->current_token);
+        }
     }
+
+cleanup_and_return_coro_body:
+    DEBUG_PRINTF("CORO_BODY_CLEANUP: Coro %s (%p). Final state: %d. Overall status for event loop: %d",
+                 coro_to_run->name ? coro_to_run->name : "unnamed", (void*)coro_to_run,
+                 coro_to_run->state, coro_to_run->state == CORO_SUSPENDED_AWAIT ? STATEMENT_YIELDED_AWAIT : STATEMENT_EXECUTED_OK);
+
+    // --- START of changes for coroutine-specific try-catch stack (cleanup) ---
+    // Save the (potentially modified) stack top back to the coroutine
+    coro_to_run->try_catch_stack_top = interpreter->try_catch_stack_top;
+    // Restore the interpreter's original stack top
+    interpreter->try_catch_stack_top = old_try_catch_stack;
+    // --- END of changes for coroutine-specific try-catch stack (cleanup) ---
+    interpreter->function_nesting_level--; // Decrement nesting level
+    interpreter->current_executing_coroutine = NULL; // Unset context
+    interpreter->current_scope = old_scope;
+    interpreter->current_self_object = old_self_obj_ctx;
+    set_lexer_state(interpreter->lexer, old_lexer_state);
+    free_token(interpreter->current_token);
+    interpreter->current_token = old_current_token;
+
+    return (coro_to_run->state == CORO_SUSPENDED_AWAIT) ? STATEMENT_YIELDED_AWAIT : STATEMENT_EXECUTED_OK;
 }

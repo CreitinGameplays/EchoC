@@ -1,4 +1,5 @@
-### EchoC is a Python-inspired programming language written and compiled with C!
+### EchoC, a Python-inspired programming language written and compiled with C
+*I had nothing to do so...*
 
 Ensure you have `Python 3.10>` installed (for compilation) and GCC (linux recommended because linux is goated).
 
@@ -7,8 +8,9 @@ Compile:
 python3 echoc_compiler.py
 ```
 
-Debug errors with valgrind/heapusage:
+Optionally, you can debug errors with valgrind/heapusage:
 ```
 valgrind -s --leak-check=full --track-origins=yes --show-leak-kinds=all ./EchoC temp.echoc
+valgrind -s --tool=helgrind ./EchoC test_codes/async_test.echoc 
 heapusage ./EchoC test_codes/async_test.echocC
 ```

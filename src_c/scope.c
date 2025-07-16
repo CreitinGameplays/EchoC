@@ -1,13 +1,46 @@
 // src_c/scope.c
 #include "scope.h"
+#include "value_utils.h" // For value_to_string_representation
 #include <string.h> // For strcmp, strdup
 #include <stdlib.h> // For malloc, free
+#include <stdbool.h> // For bool
+
+void free_scope(Scope* scope) {
+    if (!scope) return;
+
+    // Free all symbol nodes in the scope
+    SymbolNode* current = scope->symbols;
+    while (current) {
+        SymbolNode* next = current->next;
+        
+        bool is_self_object_reference = false;
+        if (current->name) {
+            is_self_object_reference = (current->value.type == VAL_OBJECT && strcmp(current->name, "self") == 0);
+        }
+
+        if (current->name) {
+            free(current->name);
+            current->name = NULL; // Good practice
+        }
+        
+        if (!is_self_object_reference) {
+            free_value_contents(current->value);
+        }
+        free(current);
+        current = next;
+    }
+    free(scope); // Free the Scope struct itself
+}
+
 
 void enter_scope(Interpreter* interpreter) {
     Scope* new_scope = (Scope*)malloc(sizeof(Scope));
     if (!new_scope) {
+        // This is a critical error - we can't continue without memory
         report_error("System", "Failed to allocate memory for new scope", interpreter->current_token);
     }
+    new_scope->id = next_scope_id++;
+    DEBUG_PRINTF("ENTER_SCOPE: Created [Scope #%llu] at %p, outer is [Scope #%llu]", new_scope->id, (void*)new_scope, interpreter->current_scope ? interpreter->current_scope->id : (uint64_t)-1);
     new_scope->symbols = NULL;
     new_scope->outer = interpreter->current_scope;
     interpreter->current_scope = new_scope;
@@ -15,6 +48,11 @@ void enter_scope(Interpreter* interpreter) {
 
 void exit_scope(Interpreter* interpreter) {
     if (interpreter->current_scope == NULL) { // Should not happen if balanced
+        // This is a programming error - log it but don't crash
+        fprintf(stderr, "Warning: Attempted to exit non-existent scope\n");
+        return;
+    }
+    if (interpreter->current_scope->outer == NULL && interpreter->current_scope->symbols != NULL) {
         report_error("System", "Attempted to exit non-existent scope", interpreter->current_token);
         return;
     }
@@ -24,52 +62,131 @@ void exit_scope(Interpreter* interpreter) {
 }
 
 void symbol_table_set(Scope* current_scope, const char* name, Value value) {
-    DEBUG_PRINTF("SYMBOL_TABLE_SET: Attempting to set variable '%s' in current scope %p", name, (void*)current_scope);
-    if (value.type == VAL_INT) {
-        DEBUG_PRINTF("  Value to set: Type: VAL_INT, Value: %ld", value.as.integer);
-    } else if (value.type == VAL_FLOAT) {
-        DEBUG_PRINTF("  Value to set: Type: VAL_FLOAT, Value: %f", value.as.floating);
-    }
+    DEBUG_PRINTF("SYMBOL_TABLE_SET_ENTRY: Setting '%s' in [Scope #%llu] %p. Current head: %s (NodeAddr: %p)",
+                 name, current_scope->id, (void*)current_scope,
+                 current_scope->symbols ? current_scope->symbols->name : "NULL_HEAD",
+                 (void*)current_scope->symbols);
 
-        // Check if variable already exists in the *current* scope to update it.
-    // This ensures 'let' re-declaration in the same scope updates the existing variable in that scope.
-    SymbolNode* current_symbol_node = current_scope->symbols;
-    while (current_symbol_node != NULL) {
-        if (strcmp(current_symbol_node->name, name) == 0) {
-            DEBUG_PRINTF("  Updating existing variable '%s' in current scope %p", name, (void*)current_scope);
-            free_value_contents(current_symbol_node->value); // Free existing value contents
-            current_symbol_node->value = value_deep_copy(value); // Deep copy the new value
-            return;
+    // Search from the current scope outwards.
+    Scope* scope_to_search = current_scope;
+    while (scope_to_search != NULL) {
+        for (SymbolNode* node = scope_to_search->symbols; node != NULL; node = node->next) {
+            if (strcmp(node->name, name) == 0) {
+                // Found it. Update the value in its definition scope and return.
+                DEBUG_PRINTF("  Updating existing variable '%s' in [Scope #%llu] %p", name, scope_to_search->id, (void*)scope_to_search);
+                Value new_value_copy = value_deep_copy(value); // Copy the new value first to handle self-assignment (e.g. let: x = x + 1)
+                free_value_contents(node->value);              // Then free the old value's contents
+                node->value = new_value_copy;                  // Then assign the new copied value
+                return;
+            }
         }
-        current_symbol_node = current_symbol_node->next;
+        scope_to_search = scope_to_search->outer;
     }
 
-    // Variable does not exist in the current scope, create a new one.
-    DEBUG_PRINTF("  Creating new variable '%s' in current scope %p", name, (void*)current_scope);
-    SymbolNode* newNode = (SymbolNode*)malloc(sizeof(SymbolNode));
+    // If we get here, the variable was not found in any accessible scope.
+    // Create a new one in the *current* scope.
+    DEBUG_PRINTF("  Creating new variable '%s' in current [Scope #%llu] %p.", name, current_scope->id, (void*)current_scope);
+
+    SymbolNode* newNode = (SymbolNode*)calloc(1, sizeof(SymbolNode));
     if (!newNode) {
-        report_error("System", "Failed to allocate memory for new symbol", NULL); // Token might not be relevant here
+        // Set exception flag instead of calling report_error directly
+        // This allows callers to handle the error gracefully
+        fprintf(stderr, "Failed to allocate memory for new symbol\n");
+        exit(1); // Or set a global error flag
+        report_error("System", "Failed to allocate memory for new symbol", NULL);
     }
     newNode->name = strdup(name);
     if (!newNode->name) {
         free(newNode);
-        report_error("System", "Failed to allocate memory for symbol name", NULL);
+        report_error("System", "Failed to allocate memory for symbol name in symbol_table_set", NULL);
     }
-    newNode->value = value_deep_copy(value); // Deep copy the value for storage
-    newNode->next = current_scope->symbols; // Add to the front of the current scope's list
+    // Use value_deep_copy which handles NULL values properly
+    // and returns an appropriate error value if copying fails
+    newNode->value = value_deep_copy(value);
+    newNode->next = current_scope->symbols;
     current_scope->symbols = newNode;
+    DEBUG_PRINTF("  SYMBOL_TABLE_SET_EXIT: After adding '%s', new head is: %s (NodeAddr: %p).",
+                 name,
+                 current_scope->symbols ? current_scope->symbols->name : "NULL_UNEXPECTED", 
+                 (void*)current_scope->symbols);
+}
+
+void symbol_table_define(Scope* scope, const char* name, Value value) {
+    if (!scope) {
+        report_error("Internal", "Attempted to define variable in a NULL scope.", NULL);
+        return;
+    }
+
+    // Check if the variable already exists in the *current* scope.
+    for (SymbolNode* node = scope->symbols; node != NULL; node = node->next) {
+        if (strcmp(node->name, name) == 0) {
+            // Variable exists in the current scope, so update it.
+            DEBUG_PRINTF("  Updating existing variable '%s' with 'let' in current scope %p", name, (void*)scope);
+            free_value_contents(node->value);
+            node->value = value_deep_copy(value);
+            return;
+        }
+    }
+
+    // Variable does not exist in the current scope, so create it.
+    DEBUG_PRINTF("  Defining new variable '%s' with 'let' in current scope %p.", name, (void*)scope);
+    SymbolNode* newNode = (SymbolNode*)calloc(1, sizeof(SymbolNode));
+    if (!newNode) {
+        report_error("System", "Failed to allocate memory for new symbol in symbol_table_define", NULL);
+    }
+    newNode->name = strdup(name);
+    if (!newNode->name) {
+        free(newNode);
+        report_error("System", "Failed to allocate memory for symbol name in symbol_table_define", NULL);
+    }
+    newNode->value = value_deep_copy(value);
+    newNode->next = scope->symbols;
+    scope->symbols = newNode;
 }
 
 Value* symbol_table_get_recursive(Scope* current_scope, const char* name) {
+    // Log the symbols head pointer at the very beginning of the function
+    DEBUG_PRINTF("SYMBOL_TABLE_GET_RECURSIVE_START: Searching for '%s'. Input [Scope #%llu] %p. Symbols Head: %p (%s)", name, current_scope ? current_scope->id : (uint64_t)-1, (void*)current_scope, (void*)(current_scope ? current_scope->symbols : NULL),
+                 (current_scope && current_scope->symbols) ? current_scope->symbols->name : "NULL_HEAD");
+    DEBUG_PRINTF("SYMBOL_TABLE_GET_RECURSIVE_ENTRY: Searching for '%s' in [Scope #%llu] %p. Initial head: %s (NodeAddr: %p)", name, current_scope ? current_scope->id : (uint64_t)-1, (void*)current_scope,
+                 current_scope->symbols ? current_scope->symbols->name : "NULL_HEAD",
+                 (void*)current_scope->symbols);
+    Scope* temp_s_log = current_scope;
+    int depth_log = 0;
+    while(temp_s_log && depth_log < 5) { // Limit depth for logging
+        DEBUG_PRINTF("  [Scope #%llu] %p (depth %d) symbols for '%s' lookup:", temp_s_log->id, (void*)temp_s_log, depth_log, name);
+        SymbolNode* sym_iter_log = temp_s_log->symbols;
+        int sym_count_log = 0;
+        while(sym_iter_log && sym_count_log < 15) { // Limit symbols per scope
+            DEBUG_PRINTF("    -> '%s' (NodeAddr: %p, Type: %d)", sym_iter_log->name, (void*)sym_iter_log, sym_iter_log->value.type);
+            sym_iter_log = sym_iter_log->next;
+            sym_count_log++;
+        }
+        if (sym_iter_log) DEBUG_PRINTF("    -> ... (more symbols in this scope)%s","");
+        temp_s_log = temp_s_log->outer;
+        depth_log++;
+    }
+    if (temp_s_log) DEBUG_PRINTF("  ... (more outer scopes for '%s' lookup)%s", name, "");
+
     DEBUG_PRINTF("SYMBOL_TABLE_GET: Attempting to find variable '%s'", name);
     Scope* scope_to_search = current_scope;
     while (scope_to_search != NULL) {
-        DEBUG_PRINTF("  Searching scope %p (outer: %p)", (void*)scope_to_search, (void*)scope_to_search->outer);
+        DEBUG_PRINTF("  Searching [Scope #%llu] %p (outer: %p)", scope_to_search->id, (void*)scope_to_search, (void*)scope_to_search->outer);
         SymbolNode* current_symbol = scope_to_search->symbols;
         while (current_symbol != NULL) {
-            DEBUG_PRINTF("    Checking against symbol '%s' in scope %p", current_symbol->name, (void*)scope_to_search);
+            DEBUG_PRINTF("    Checking against symbol '%s' in [Scope #%llu]", current_symbol->name, scope_to_search->id);
+            // --- START: ADD THIS DEBUG BLOCK ---
+            //if (strcmp(current_symbol->name, name) == 0 && strcmp(name, "extra_resources") == 0) {
+            //    printf("\n>>> SCOPE_GET_DEBUG: Accessing variable 'extra_resources' in scope %p\n", (void*)scope_to_search);
+            //    char* dbg_str = value_to_string_representation(current_symbol->value, NULL, NULL);
+            //    printf(">>> SCOPE_GET_DEBUG: Value Type: %d, Content: %s\n\n", current_symbol->value.type, dbg_str);
+            //    fflush(stdout);
+            //    free(dbg_str);
+            //}
+            // --- END: ADD THIS DEBUG BLOCK ---
+
             if (strcmp(current_symbol->name, name) == 0) {
-                DEBUG_PRINTF("    FOUND variable '%s' in scope %p.", name, (void*)scope_to_search);
+                DEBUG_PRINTF("    FOUND variable '%s' in [Scope #%llu] %p.", name, scope_to_search->id, (void*)scope_to_search);
                 if (current_symbol->value.type == VAL_INT) {
                     DEBUG_PRINTF("      Type: VAL_INT, Value: %ld", current_symbol->value.as.integer);
                 } else if (current_symbol->value.type == VAL_FLOAT) {
@@ -83,7 +200,7 @@ Value* symbol_table_get_recursive(Scope* current_scope, const char* name) {
         }
         scope_to_search = scope_to_search->outer; // Move to outer scope
     }
-    DEBUG_PRINTF("  Variable '%s' NOT FOUND in any accessible scope starting from %p.", name, (void*)current_scope);
+    DEBUG_PRINTF("  Variable '%s' NOT FOUND in any accessible scope starting from [Scope #%llu] %p.", name, current_scope ? current_scope->id : (uint64_t)-1, (void*)current_scope);
     return NULL; // Not found in any accessible scope
 }
 
@@ -128,4 +245,15 @@ VarScopeInfo get_variable_definition_scope_and_value(Scope* search_start_scope, 
         scope_to_search = scope_to_search->outer;
     }
     return info; // Not found
+}
+
+void print_scope_contents(Scope* scope) {
+    if (!scope) {
+        DEBUG_PRINTF("Scope is NULL.%s", ""); // Added empty string argument
+        return;
+    }
+    DEBUG_PRINTF("Scope contents (Scope Addr: %p):", (void*)scope);
+    for (SymbolNode* current = scope->symbols; current != NULL; current = current->next) {
+        DEBUG_PRINTF("  - Symbol: '%s' (Type: %d, Addr: %p, Next: %p)", current->name, current->value.type, (void*)current, (void*)current->next);
+    }
 }

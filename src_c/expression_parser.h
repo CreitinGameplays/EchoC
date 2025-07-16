@@ -17,16 +17,15 @@ typedef struct {
     bool is_standalone_primary_id;
 } ExprResult;
 
-
 // Entry point for parsing any expression (lowest precedence is ternary).
-ExprResult interpret_ternary_expr(Interpreter* interpreter); // Added forward declaration
-// ExprResult interpret_ternary_expr(Interpreter* interpreter); // Replaced by await
-ExprResult interpret_await_expr(Interpreter* interpreter); // New entry point
+ExprResult interpret_conditional_expr(Interpreter* interpreter); // New entry point for inline if/else
+ExprResult interpret_await_expr(Interpreter* interpreter);
 
 // Expression parsing functions by precedence (lowest to highest)
 ExprResult interpret_logical_or_expr(Interpreter* interpreter);
 ExprResult interpret_logical_and_expr(Interpreter* interpreter);
 ExprResult interpret_equality_expr(Interpreter* interpreter);
+ExprResult interpret_identity_expr(Interpreter* interpreter);
 ExprResult interpret_comparison_expr(Interpreter* interpreter);
 ExprResult interpret_additive_expr(Interpreter* interpreter);
 ExprResult interpret_multiplicative_expr(Interpreter* interpreter);
@@ -37,9 +36,8 @@ ExprResult interpret_primary_expr(Interpreter* interpreter); // For literals, id
 
 // The actual lowest precedence expression is now await or ternary if await is not present.
 // For simplicity, let's make interpret_ternary_expr call interpret_await_expr if await is higher,
-// or make interpret_await_expr the new entry point.
-#define interpret_expression interpret_await_expr // Define the main entry for expression parsing
-// Specific literal/construct parsers called by the above
+// or make interpret_await_expr the new entry point. This is now conditional_expr.
+#define interpret_expression interpret_conditional_expr // Define the main entry for expression parsing
 Value interpret_dictionary_literal(Interpreter* interpreter);
 // Value interpret_array_literal(Interpreter* interpreter); // Called by primary_expr
 // Value interpret_tuple_literal(Interpreter* interpreter); // Called by primary_expr
@@ -52,6 +50,9 @@ Value interpret_instance_creation(Interpreter* interpreter, Blueprint* bp_to_ins
 
 // Helper to execute an EchoC function (not C builtins) with pre-evaluated arguments.
 // If self_obj is NULL, it's a regular function call.
-Value execute_echoc_function(Interpreter* interpreter, Function* func_to_call, Object* self_obj, Value* call_args, bool* call_args_freshness, int arg_count, Token* call_site_token);
+Value execute_echoc_function(Interpreter* interpreter, Function* func_to_call, Object* self_obj, ParsedArgument* parsed_args, int arg_count, Token* call_site_token);
+
+// Helper to determine the truthiness of a value.
+bool value_is_truthy(Value v);
 
 #endif // ECHOC_EXPRESSION_PARSER_H

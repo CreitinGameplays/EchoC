@@ -4,6 +4,9 @@
 
 #include "header.h" // Provides Value, Dictionary, Token, report_error, value_deep_copy, free_value_contents
 
+// A simple and widely used hash function for strings (djb2).
+unsigned long hash_string(const char* str);
+
 // Creates a new dictionary.
 Dictionary* dictionary_create(int initial_buckets, Token* error_token);
 
@@ -23,5 +26,8 @@ bool dictionary_try_get(Dictionary* dict, const char* key_str, Value* out_val, b
 
 // Frees the dictionary, its entries, and optionally the keys and values if specified.
 void dictionary_free(Dictionary* dict, int free_keys, int free_values_contents);
+
+// Helper to create a dictionary entry (used internally for optimized copying)
+DictEntry* dictionary_create_entry(const char* key, Value value, Token* error_token);
 
 #endif // ECHOC_DICTIONARY_H

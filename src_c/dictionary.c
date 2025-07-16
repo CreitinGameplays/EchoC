@@ -5,7 +5,7 @@
 #include <stdio.h>  // For snprintf
 
 // Simple hash function for strings (djb2)
-static unsigned long hash_string(const char* str) {
+unsigned long hash_string(const char* str) {
     unsigned long hash = 5381;
     int c;
     while ((c = *str++)) hash = ((hash << 5) + hash) + c; /* hash * 33 + c */
@@ -17,11 +17,30 @@ static void dictionary_resize(Dictionary* dict, Token* error_token); // Forward 
 Dictionary* dictionary_create(int initial_buckets, Token* error_token) {
     Dictionary* dict = malloc(sizeof(Dictionary));
     if (!dict) report_error("System", "Failed to allocate memory for dictionary", error_token);
+    dict->id = next_dictionary_id++;
     dict->num_buckets = initial_buckets > 0 ? initial_buckets : 16; // Default to 16 buckets
     dict->count = 0;
     dict->buckets = calloc(dict->num_buckets, sizeof(DictEntry*)); // Initialize all bucket pointers to NULL
     if (!dict->buckets) { free(dict); report_error("System", "Failed to allocate memory for dictionary buckets", error_token); }
+    DEBUG_PRINTF("DICTIONARY_CREATE: Created [Dict #%llu] at %p", dict->id, (void*)dict);
     return dict;
+}
+
+// Helper to create a dictionary entry (used internally for optimized copying and set)
+DictEntry* dictionary_create_entry(const char* key, Value value, Token* error_token) {
+    DictEntry* new_entry = malloc(sizeof(DictEntry));
+    if (!new_entry) {
+        report_error("System", "Failed to allocate memory for dictionary entry", error_token);
+    }
+    new_entry->key = strdup(key);
+    if (!new_entry->key) {
+        free(new_entry);
+        report_error("System", "Failed to allocate memory for dictionary key", error_token);
+    }
+    new_entry->value = value_deep_copy(value); // Deep copy the value
+    new_entry->next = NULL;
+
+    return new_entry;
 }
 
 void dictionary_set(Dictionary* dict, const char* key_str, Value value, Token* error_token) {
@@ -43,16 +62,7 @@ void dictionary_set(Dictionary* dict, const char* key_str, Value value, Token* e
     }
 
     // Key does not exist, create new entry
-    DictEntry* new_entry = malloc(sizeof(DictEntry));
-    if (!new_entry) report_error("System", "Failed to allocate memory for dictionary entry", error_token);
-    
-    new_entry->key = strdup(key_str);
-    if (!new_entry->key) {
-        free(new_entry);
-        report_error("System", "Failed to allocate memory for dictionary key", error_token);
-    }
-    new_entry->value = value_deep_copy(value); // Deep copy the value
-    new_entry->next = NULL;
+    DictEntry* new_entry = dictionary_create_entry(key_str, value, error_token);
 
     if (prev_entry == NULL) { // Bucket was empty
         dict->buckets[index] = new_entry;
@@ -138,6 +148,21 @@ bool dictionary_try_get(Dictionary* dict, const char* key_str, Value* out_val, b
         current_entry = current_entry->next;
     }
     return false; // Not found
+}
+
+Value* dictionary_try_get_value_ptr(Dictionary* dict, const char* key_str) {
+    if (!dict || !key_str) return NULL;
+    unsigned long hash = hash_string(key_str);
+    int index = hash % dict->num_buckets;
+
+    DictEntry* current_entry = dict->buckets[index];
+    while (current_entry != NULL) {
+        if (strcmp(current_entry->key, key_str) == 0) {
+            return &(current_entry->value);
+        }
+        current_entry = current_entry->next;
+    }
+    return NULL; // Not found
 }
 
 void dictionary_free(Dictionary* dict, int free_keys, int free_values_contents) {
