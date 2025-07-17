@@ -425,6 +425,7 @@ int main(int argc, char* argv[]) {
     #endif
 
     if (argc != 2) {
+        printf("EchoC Interpreter version %s\n", ECHOC_VERSION);
         printf("Usage: %s <filename.echoc>\n", argv[0]);
         return 1;
     }

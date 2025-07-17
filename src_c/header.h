@@ -1,6 +1,8 @@
 // src_c/header.h
 #ifndef ECHOC_HEADER_H
 #define ECHOC_HEADER_H
+// Current version
+#define ECHOC_VERSION "1.0.0-alpha"
 
 #include <stdio.h>
 #include <stdlib.h>
