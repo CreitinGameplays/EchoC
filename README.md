@@ -8,7 +8,7 @@ EchoC is a dynamically-typed, object-oriented, and asynchronous interpreter lang
 
 ## Features
 
-EchoC supports a growing number of modern language features:
+It supports a growing number of modern language features:
 
 *   **Rich Data Types**: `integer`, `float`, `string`, `boolean`, `null`, and container types like `array`, `tuple`, and `dictionary`.
 *   **Control Flow**:
