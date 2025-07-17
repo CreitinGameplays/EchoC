@@ -111,6 +111,8 @@ python3 echoc_compiler.py
 ```
 This will produce an executable named EchoC in the root directory.
 
+(I didn't test it on Windows yet)
+
 ## Running a Script
 To run an EchoC script, pass the filename as an argument to the interpreter:
 ```bash
