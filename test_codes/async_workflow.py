@@ -1,6 +1,7 @@
 import asyncio
 
 # --- Synchronous Helper Functions ---
+# python version to compare with async_workflow.echoc
 
 def generate_initial_data(count):
     """Generates a list of dictionaries for initial processing."""

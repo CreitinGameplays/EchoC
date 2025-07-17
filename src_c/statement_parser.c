@@ -2151,10 +2151,94 @@ static void interpret_load_statement(Interpreter* interpreter) {
     do {
         // These variables must be local to each iteration of the load statement
         char* module_source_identifier_str = NULL;
-        bool explicit_as_keyword_used = false;
         char* alias_str = NULL;
 
-        if (interpreter->current_token->type == TOKEN_ID || interpreter->current_token->type == TOKEN_STRING) { // Form 1: load: module [as alias]
+        // Determine if this is a 'from' import (e.g. `load: item from module` or `load: (items) from module`)
+        bool is_from_import = false;
+        if (interpreter->current_token->type == TOKEN_LPAREN) {
+            is_from_import = true;
+        } else if (interpreter->current_token->type == TOKEN_ID || interpreter->current_token->type == TOKEN_STRING) {
+            Token* next_token = peek_next_token(interpreter->lexer);
+            if (next_token && next_token->type == TOKEN_FROM) {
+                is_from_import = true;
+            }
+            free_token(next_token);
+        }
+
+        if (is_from_import) {
+            // Handles `load: item from module` and `load: (items) from module`
+            #define MAX_LOAD_ITEMS 10
+            char* item_names[MAX_LOAD_ITEMS];
+            char* item_aliases[MAX_LOAD_ITEMS];
+            int item_count = 0;
+
+            if (interpreter->current_token->type == TOKEN_LPAREN) {
+                interpreter_eat(interpreter, TOKEN_LPAREN);
+                while (interpreter->current_token->type != TOKEN_RPAREN && item_count < MAX_LOAD_ITEMS) {
+                    if (interpreter->current_token->type != TOKEN_ID) report_error("Syntax", "Expected item name in 'load from' list.", interpreter->current_token);
+                    item_names[item_count] = strdup(interpreter->current_token->value);
+                    item_aliases[item_count] = item_names[item_count]; // Default alias
+                    interpreter_eat(interpreter, TOKEN_ID);
+                    if (interpreter->current_token->type == TOKEN_AS) {
+                        interpreter_eat(interpreter, TOKEN_AS);
+                        if (interpreter->current_token->type != TOKEN_ID) report_error("Syntax", "Expected alias for item in 'load from' list.", interpreter->current_token);
+                        if (item_aliases[item_count] != item_names[item_count]) free(item_aliases[item_count]);
+                        item_aliases[item_count] = strdup(interpreter->current_token->value);
+                        interpreter_eat(interpreter, TOKEN_ID);
+                    }
+                    item_count++;
+                    if (interpreter->current_token->type == TOKEN_COMMA) interpreter_eat(interpreter, TOKEN_COMMA);
+                    else if (interpreter->current_token->type != TOKEN_RPAREN) report_error("Syntax", "Expected ',' or ')' in 'load from' item list.", interpreter->current_token);
+                }
+                interpreter_eat(interpreter, TOKEN_RPAREN);
+            } else { // Single item import
+                if (interpreter->current_token->type != TOKEN_ID) report_error("Syntax", "Expected item name for 'load from' statement.", interpreter->current_token);
+                item_names[0] = strdup(interpreter->current_token->value);
+                item_aliases[0] = item_names[0]; // No 'as' for simple form
+                item_count = 1;
+                interpreter_eat(interpreter, TOKEN_ID);
+            }
+
+            interpreter_eat(interpreter, TOKEN_FROM);
+
+            char* module_name_or_path_str = NULL;
+            Token* module_origin_token = token_deep_copy(interpreter->current_token);
+            if (interpreter->current_token->type == TOKEN_ID) {
+                module_name_or_path_str = strdup(interpreter->current_token->value);
+                interpreter_eat(interpreter, TOKEN_ID);
+            } else if (interpreter->current_token->type == TOKEN_STRING) {
+                module_name_or_path_str = strdup(interpreter->current_token->value);
+                interpreter_eat(interpreter, TOKEN_STRING);
+            } else {
+                free_token(module_origin_token);
+                report_error("Syntax", "Expected module name (identifier or string path) after 'from' in load statement.", interpreter->current_token);
+            }
+
+            Value module_namespace;
+            if (is_builtin_module(module_name_or_path_str)) {
+                module_namespace = get_or_create_builtin_module(interpreter, module_name_or_path_str, module_origin_token);
+            } else {
+                char* abs_path = resolve_module_path(interpreter, module_name_or_path_str, module_origin_token);
+                module_namespace = load_module_from_path(interpreter, abs_path, module_origin_token);
+                free(abs_path);
+            }
+
+            for (int i = 0; i < item_count; ++i) {
+                Value item_val = dictionary_get(module_namespace.as.dict_val, item_names[i], module_origin_token);
+                symbol_table_set(interpreter->current_scope, item_aliases[i], item_val);
+                free_value_contents(item_val);
+            }
+            free_value_contents(module_namespace);
+
+            for (int i = 0; i < item_count; ++i) {
+                if (item_aliases[i] != item_names[i]) free(item_aliases[i]);
+                free(item_names[i]);
+            }
+            free(module_name_or_path_str);
+            free_token(module_origin_token);
+
+        } else if (interpreter->current_token->type == TOKEN_ID || interpreter->current_token->type == TOKEN_STRING) { // Form 1: load: module [as alias]
+            bool explicit_as_keyword_used = false;
             module_source_identifier_str = strdup(interpreter->current_token->value);
             Token* module_source_token = token_deep_copy(interpreter->current_token);
             interpreter_eat(interpreter, interpreter->current_token->type); // Eat ID or STRING
@@ -2193,79 +2277,6 @@ static void interpret_load_statement(Interpreter* interpreter) {
             free(module_source_identifier_str);
             free_token(module_source_token);
             if (alias_str) free(alias_str);
-
-        } else if (interpreter->current_token->type == TOKEN_LPAREN) { // Form 2: load: (items) from module
-            interpreter_eat(interpreter, TOKEN_LPAREN);
-            // For simplicity, let's assume a fixed max number of items to import for now
-            #define MAX_LOAD_ITEMS 10
-            char* item_names[MAX_LOAD_ITEMS];
-            char* item_aliases[MAX_LOAD_ITEMS];
-            int item_count = 0;
-
-            while (interpreter->current_token->type != TOKEN_RPAREN && item_count < MAX_LOAD_ITEMS) {
-                if (interpreter->current_token->type != TOKEN_ID) {
-                    report_error("Syntax", "Expected item name in 'load from' list.", interpreter->current_token);
-                }
-                item_names[item_count] = strdup(interpreter->current_token->value);
-                item_aliases[item_count] = item_names[item_count]; // Default alias
-                interpreter_eat(interpreter, TOKEN_ID);
-
-                if (interpreter->current_token->type == TOKEN_AS) {
-                    interpreter_eat(interpreter, TOKEN_AS);
-                    if (interpreter->current_token->type != TOKEN_ID) {
-                        report_error("Syntax", "Expected alias for item in 'load from' list.", interpreter->current_token);
-                    }
-                    if (item_aliases[item_count] != item_names[item_count]) free(item_aliases[item_count]);
-                    item_aliases[item_count] = strdup(interpreter->current_token->value);
-                    interpreter_eat(interpreter, TOKEN_ID);
-                }
-                item_count++;
-                if (interpreter->current_token->type == TOKEN_COMMA) interpreter_eat(interpreter, TOKEN_COMMA);
-                else if (interpreter->current_token->type != TOKEN_RPAREN) {
-                    report_error("Syntax", "Expected ',' or ')' in 'load from' item list.", interpreter->current_token);
-                }
-            }
-            // After parsing items, current_token is RPAREN. Eat it.
-            interpreter_eat(interpreter, TOKEN_RPAREN);
-            // Next token must be FROM. Eat it.
-            interpreter_eat(interpreter, TOKEN_FROM);
-            char* module_name_or_path_str = NULL;
-            Token* module_origin_token = token_deep_copy(interpreter->current_token); // For error reporting context
-
-            if (interpreter->current_token->type == TOKEN_ID) {
-                module_name_or_path_str = strdup(interpreter->current_token->value);
-                interpreter_eat(interpreter, TOKEN_ID);
-            } else if (interpreter->current_token->type == TOKEN_STRING) {
-                module_name_or_path_str = strdup(interpreter->current_token->value); // Lexer handles unquoting
-                interpreter_eat(interpreter, TOKEN_STRING);
-            } else {
-                free_token(module_origin_token);
-                report_error("Syntax", "Expected module name (identifier or string path) after 'from' in load statement.", interpreter->current_token);
-            }
-
-            Value module_namespace;
-            if (is_builtin_module(module_name_or_path_str)) {
-                module_namespace = get_or_create_builtin_module(interpreter, module_name_or_path_str, module_origin_token);
-            } else {
-                char* abs_path = resolve_module_path(interpreter, module_name_or_path_str, module_origin_token);
-                module_namespace = load_module_from_path(interpreter, abs_path, module_origin_token);
-                free(abs_path);
-            }
-
-            for (int i = 0; i < item_count; ++i) {
-                Value item_val = dictionary_get(module_namespace.as.dict_val, item_names[i], module_origin_token);
-                symbol_table_set(interpreter->current_scope, item_aliases[i], item_val);
-                free_value_contents(item_val);
-            }
-            free_value_contents(module_namespace);
-
-            for (int i = 0; i < item_count; ++i) {
-                if (item_aliases[i] != item_names[i])
-                    free(item_aliases[i]);
-                free(item_names[i]);
-            }
-            free(module_name_or_path_str);
-            free_token(module_origin_token);
         } else {
             report_error_unexpected_token(interpreter, "a module name or '(' for item import list");
         }

@@ -20,7 +20,7 @@ C_SOURCE_FILES = [
 ]
 
 # --- Build Configuration ---
-DEBUG_MODE = False  # Set to False for release builds
+DEBUG_MODE = True  # Set to False for release builds
 
 def main():
     executable_name = "EchoC"
