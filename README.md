@@ -1,9 +1,9 @@
-# EchoC, a Python-inspired interpreter language written and compiled with C (work-in-progress)
+## EchoC, a Python-inspired interpreter language written and compiled with C (work-in-progress)
 *I had nothing to do so...*
 
 EchoC is a dynamically-typed, object-oriented, and asynchronous interpreter language written from scratch in C with the help of Google Gemini. It is designed to be a learning project and a playground for language design concepts, drawing heavy inspiration from Python's syntax and semantics.
 
-# Features
+## Features
 
 EchoC supports a growing number of modern language features:
 
@@ -39,7 +39,7 @@ EchoC supports a growing number of modern language features:
     *   Ternary expressions: `let: x = "big" if a > 10 else "small":`.
     *   Full suite of arithmetic, logical, and comparison operators.
 
-# Examples
+## Examples
 
 ### Basic "Hello World"
 ```echoc
@@ -47,7 +47,7 @@ EchoC supports a growing number of modern language features:
 show("Hello, World!"):
 ```
 
-# Functions
+## Functions
 ```echoc
 funct: greet(name="there"):
     return: "Hello, %{name}!":
@@ -56,7 +56,7 @@ show(greet("Alice")):
 show(greet()):
 ```
 
-# Object-Oriented Programming with `blueprint`
+## Object-Oriented Programming with `blueprint`
 ```echoc
 blueprint: Dog:
     funct: init(self, name):
@@ -73,7 +73,7 @@ show(my_dog): -- "Dog named Rex" --
 my_dog.bark(): -- "Rex says Woof!" --
 ```
 
-# Asynchronous Example
+## Asynchronous Example
 ```echoc
 load: (weave, rest, gather) from weaver:
 load: binary_search_sqrt from "src_c/echoc_features/sqrt.ecc":
@@ -97,18 +97,18 @@ async funct: main():
 weave(main()):
 ```
 
-# Prerequisites
+## Prerequisites
 - A C compiler (GCC is recommended).
 - Python 3.10+ (used for the simple build script)
 
-# Building
+## Building
 The project includes a Python script that invokes the C compiler with the correct source files.
 ```bash
 python3 echoc_compiler.py
 ```
 This will produce an executable named EchoC in the root directory.
 
-# Running a Script
+## Running a Script
 To run an EchoC script, pass the filename as an argument to the interpreter:
 ```bash
 ./EchoC my_script.echoc
