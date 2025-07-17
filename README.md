@@ -126,6 +126,7 @@ valgrind -s --leak-check=full --track-origins=yes --show-leak-kinds=all ./EchoC 
 
 Syntax Highlight for EchoC (VSCode): [EchoC Syntax Highlight](https://github.com/CreitinGameplays/EchoC-Syntax-Highlight)
 
+### Note
 EchoC is a personal project and a work in progress. While it supports a growing set of features, you may encounter bugs or limitations.
 Contributions, bug reports, and suggestions are highly appreciated! Feel free to open an issue or submit a pull request on the project's repository.
 
