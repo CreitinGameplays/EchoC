@@ -1,3 +1,6 @@
+![echoc logo](https://raw.githubusercontent.com/CreitinGameplays/EchoC/refs/heads/main/logo/echoc.png "Logo")
+
+
 ## EchoC, a Python-inspired interpreter language written and compiled with C (work-in-progress)
 *I had nothing to do so...*
 
