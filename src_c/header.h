@@ -290,6 +290,7 @@ typedef struct Coroutine {
     Array* gather_results;      // Array of Value for results from children
     int gather_pending_count;   // Number of children gather is still waiting for
     int gather_first_exception_idx; // Index of the first child exception in gather_results, or -1
+    bool gather_return_exceptions; // New flag for gather behavior
     struct Coroutine* parent_gather_coro; // Link to parent gather task, if any
 
     int is_cancelled;           // Flag: 1 if cancellation has been requested
@@ -357,6 +358,7 @@ struct InterpreterImpl {
     char* current_executing_file_path; // New field for better error reporting
     bool prevent_side_effects; // For true short-circuiting
     int resume_depth; // For preventing side-effects during async resume re-execution
+    bool gather_last_return_exceptions_flag; // HACK: To pass option to C function
     bool is_dummy_resume_value; // Flag to signal a dummy value from a mismatched await
 }; // The typedef 'Interpreter' is already declared above using the tag
 

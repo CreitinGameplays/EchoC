@@ -526,6 +526,7 @@ int main(int argc, char* argv[]) {
         .repr_depth_count = 0, // Initialize new field
         .prevent_side_effects = false, // Initialize new flag
         .resume_depth = 0, // Initialize async resume depth
+        .gather_last_return_exceptions_flag = false, // Initialize new flag
     };
     interpreter.is_dummy_resume_value = false; // Initialize new flag
     free(initial_file_abs_path); // directory path was strdup'd

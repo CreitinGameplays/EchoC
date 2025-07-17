@@ -1,0 +1,114 @@
+-- test_weaver.ecc --
+-- A comprehensive test suite for the 'weaver' async module. --
+
+-- First, load the weaver module. --
+load: weaver:
+
+-- A simple async task that rests and returns a value. --
+async funct: simple_task(id, duration_ms):
+    show("Task %{id} started."):
+    await weaver.rest(duration_ms):
+    show("Task %{id} finished after %{duration_ms}ms."):
+    return: "Result from task %{id}":
+
+-- A task that runs for a while, designed to be cancelled. --
+async funct: long_running_task():
+    show("Long-running task started, will loop for 500ms."):
+    let: i = 0:
+    loop: while i < 5:
+        show("  (Long-running task alive, iteration %{i+1})"):
+        await weaver.rest(100):
+        let: i = i + 1:
+    return: "Long-running task finished normally (should not happen in cancel test).":
+
+-- A task that is designed to fail. --
+async funct: failing_task():
+    show("Failing task started."):
+    await weaver.rest(10):
+    raise: "This task is designed to fail!":
+    return: "This will not be returned.":
+
+-- The main async function to run all tests. --
+async funct: main():
+    show("--- Weaver Test Suite Started ---"):
+
+    -- 1. Test weaver.rest() and weaver.yield_now() --
+    show("\n[1] Testing weaver.rest() and weaver.yield_now()"):
+    show("    - Main: Before rest(100)."):
+    await weaver.rest(100):
+    show("    - Main: After rest(100)."):
+    show("    - Main: Before yield_now()."):
+    await weaver.yield_now(): -- Yields control to event loop --
+    show("    - Main: After yield_now()."):
+
+    -- 2. Test weaver.spawn_task() --
+    show("\n[2] Testing weaver.spawn_task()"):
+    show("    - Main: Spawning a background task (simple_task 'A', 50ms)."):
+    let: background_task = weaver.spawn_task(simple_task("A", 50)):
+    show("    - Main: Task spawned. Main coroutine continues immediately."):
+    await weaver.rest(150): -- Wait long enough for the spawned task to complete --
+    show("    - Main: Finished waiting. Background task should be done."):
+
+    -- 3. Test weaver.gather() with successful tasks --
+    show("\n[3] Testing weaver.gather() with successful tasks"):
+    let: tasks_to_gather = [
+        simple_task("B", 80),
+        simple_task("C", 40)
+    ]:
+    show("    - Main: Gathering two tasks (80ms and 40ms). Should take ~80ms total."):
+    let: gather_results = await weaver.gather(tasks_to_gather):
+    show("    - Main: Gather complete. Results:"):
+    show(gather_results):
+
+    -- 4. Test weaver.cancel() --
+    show("\n[4] Testing weaver.cancel()"):
+    show("    - Main: Spawning a long-running task to be cancelled."):
+    let: task_to_cancel = weaver.spawn_task(long_running_task()):
+    show("    - Main: Waiting 50ms before cancelling."):
+    await weaver.rest(50):
+    show("    - Main: Cancelling the task now."):
+    weaver.cancel(task_to_cancel):
+    show("    - Main: Awaiting the cancelled task to see the exception."):
+    try:
+        await task_to_cancel:
+        show("    - Main: [FAIL] Awaiting a cancelled task did not raise an exception."):
+    catch as e:
+        show("    - Main: [SUCCESS] Caught expected exception from cancelled task:"):
+        show(e):
+
+    -- 5. Test weaver.gather() with a failing task --
+    show("\n[5] Testing weaver.gather() with a failing task"):
+    let: mixed_tasks = [
+        simple_task("D", 20),
+        failing_task(),
+        simple_task("E", 30) -- This may or may not run depending on timing --
+    ]:
+    show("    - Main: Gathering tasks, one of which will fail."):
+    try:
+        await weaver.gather(mixed_tasks):
+        show("    - Main: [FAIL] Gathering tasks with a failure did not raise an exception."):
+    catch as e:
+        show("    - Main: [SUCCESS] Caught expected exception from gather:"):
+        show(e):
+
+    -- 6. Test calling a function stored in a variable --
+    show("\n[6] Testing calling a function from a variable"):
+    let: my_task_func = simple_task:
+    show("    - Main: Calling simple_task via a variable."):
+    let: my_task = my_task_func("F", 10): -- Calling a function from a variable --
+    await my_task:
+    show("    - Main: Call from variable complete."):
+
+    show("\n--- Weaver Test Suite Finished ---"):
+    return: "All tests completed.":
+
+-- Synchronous entry point to start the async tests. --
+funct: start():
+    show("Starting weaver tests..."):
+    let: main_coro = main():
+    let: final_result = weaver.weave(main_coro):
+    show("\nWeave finished. Final result from main coroutine:"):
+    show(final_result):
+
+-- Run the test suite. --
+start():

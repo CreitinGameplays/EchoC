@@ -159,7 +159,7 @@ async funct: main_async_workflow():
                 let: resource_task2 = fetch_resource_data("extra_B_%{current_item["id"]}", "non_existent_fail_id"):
                 
                 show("LOOP: Gathering extra resources..."):
-                let: extra_resources = await weaver.gather([resource_task1, resource_task2]):
+                let: extra_resources = await weaver.gather([resource_task1, resource_task2], return_exceptions=true):
                 show("debug 2: %{extra_resources}"):
                 show("LOOP: Extra resources gathered. Count: %{extra_resources.len}"):
                 
@@ -228,7 +228,7 @@ async funct: main_async_workflow():
         final_tasks_to_run.append(task_coro):
     
     show("Final tasks created. Gathering all %{final_tasks_to_run.len} final tasks..."):
-    let: final_gathered_results = await weaver.gather(final_tasks_to_run):
+    let: final_gathered_results = await weaver.gather(final_tasks_to_run, return_exceptions=true):
     show("--- Final batch tasks gathered ---"):
 
     let: i = 0:
@@ -239,8 +239,6 @@ async funct: main_async_workflow():
         elif: type(res) == "dictionary":
             show("Final Task %{i} Result (Success for '%{res["id"]}'): %{slice(res["content"], 0, 20)}..."):
             processed_results.append({"id": res["id"], "result": "Final task success", "content_preview": slice(res["content"], 0, 10)}):
-        else:
-            show("Final Task %{i} Result (Unknown type): %{res}"):
         let: i = i + 1:
 
     let: final_report = format_report(processed_results, error_log):

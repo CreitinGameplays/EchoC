@@ -452,9 +452,15 @@ static void handle_completed_coroutine(Interpreter* interpreter, Coroutine* done
                         free_value_contents(parent_gather->gather_results->elements[i]);
                     }
                     if (done_coro->has_exception) {
-                        parent_gather->gather_results->elements[i] = value_deep_copy(done_coro->exception_value);
-                        if (parent_gather->gather_first_exception_idx == -1) {
-                            parent_gather->gather_first_exception_idx = i;
+                        if (parent_gather->gather_return_exceptions) {
+                            // Fail-safe: store exception as a result, don't mark gather as failed.
+                            parent_gather->gather_results->elements[i] = value_deep_copy(done_coro->exception_value);
+                        } else {
+                            // Fail-fast: store exception and mark gather as failed.
+                            parent_gather->gather_results->elements[i] = value_deep_copy(done_coro->exception_value);
+                            if (parent_gather->gather_first_exception_idx == -1) {
+                                parent_gather->gather_first_exception_idx = i;
+                            }
                         }
                     } else {
                         parent_gather->gather_results->elements[i] = value_deep_copy(done_coro->result_value);
@@ -477,43 +483,43 @@ static void handle_completed_coroutine(Interpreter* interpreter, Coroutine* done
                     if (is_gather_task_now_done) {
                         DEBUG_PRINTF("Gather task %s (%p) is now complete. Finalizing.", parent_gather->name, (void*)parent_gather);
                         parent_gather->state = CORO_DONE;
-                        parent_gather->has_exception = 0;
-
-                        // The final result of a gather task is a NEW array containing the results
-                        // of all its children. This decouples the result from the internal storage.
-
-                        // 1. Create a new Array struct for the final result.
-                        Array* final_results_array = (Array*)malloc(sizeof(Array));
-                        if (!final_results_array) report_error("System", "Failed to allocate final results array for gather.", NULL);
-                        
-                        final_results_array->count = parent_gather->gather_results->count;
-                        final_results_array->capacity = parent_gather->gather_results->capacity;
-                        
-                        if (final_results_array->count > 0) {
+                        if (parent_gather->gather_return_exceptions) {
+                            // Fail-safe mode: always succeeds and returns the mixed results array.
+                            parent_gather->has_exception = 0;
+                            Array* final_results_array = (Array*)malloc(sizeof(Array));
+                            if (!final_results_array) report_error("System", "Failed to allocate final results array for gather.", NULL);
+                            final_results_array->count = parent_gather->gather_results->count;
+                            final_results_array->capacity = parent_gather->gather_results->capacity;
                             final_results_array->elements = (Value*)malloc(sizeof(Value) * final_results_array->capacity);
-                            if (!final_results_array->elements) {
-                                free(final_results_array);
-                                report_error("System", "Failed to allocate elements for final gather results array.", NULL);
+                            if (!final_results_array->elements) { free(final_results_array); report_error("System", "Failed to allocate elements for final gather results array.", NULL); }
+                            for (int j = 0; j < final_results_array->count; j++) {
+                                final_results_array->elements[j] = value_deep_copy(parent_gather->gather_results->elements[j]);
                             }
-                            // 2. Deep-copy each result from the gather task's internal storage into our new public-facing array.
-                            for (int i = 0; i < final_results_array->count; i++) {
-                                final_results_array->elements[i] = value_deep_copy(parent_gather->gather_results->elements[i]);
-                            }
+                            if (parent_gather->result_value.type != VAL_NULL) free_value_contents(parent_gather->result_value);
+                            parent_gather->result_value.type = VAL_ARRAY;
+                            parent_gather->result_value.as.array_val = final_results_array;
+                        } else if (parent_gather->gather_first_exception_idx != -1) {
+                            // A child failed. The gather task itself fails.
+                            parent_gather->has_exception = 1;
+                            free_value_contents(parent_gather->exception_value); // Free old (should be null)
+                            parent_gather->exception_value = value_deep_copy(parent_gather->gather_results->elements[parent_gather->gather_first_exception_idx]);
                         } else {
-                            final_results_array->elements = NULL;
+                            // No child failed. The gather task succeeds.
+                            parent_gather->has_exception = 0;
+                            // The final result is an array of the results.
+                            Array* final_results_array = (Array*)malloc(sizeof(Array));
+                            if (!final_results_array) report_error("System", "Failed to allocate final results array for gather.", NULL);
+                            final_results_array->count = parent_gather->gather_results->count;
+                            final_results_array->capacity = parent_gather->gather_results->capacity;
+                            final_results_array->elements = (Value*)malloc(sizeof(Value) * final_results_array->capacity);
+                            if (!final_results_array->elements) { free(final_results_array); report_error("System", "Failed to allocate elements for final gather results array.", NULL); }
+                            for (int j = 0; j < final_results_array->count; j++) {
+                                final_results_array->elements[j] = value_deep_copy(parent_gather->gather_results->elements[j]);
+                            }
+                            if (parent_gather->result_value.type != VAL_NULL) free_value_contents(parent_gather->result_value);
+                            parent_gather->result_value.type = VAL_ARRAY;
+                            parent_gather->result_value.as.array_val = final_results_array;
                         }
-
-                        // 3. Free the old placeholder result_value before assigning the new one.
-                        if (parent_gather->result_value.type != VAL_NULL) {
-                            free_value_contents(parent_gather->result_value);
-                        }
-
-                        // 4. Assign the new array as the gather task's final result.
-                        parent_gather->result_value.type = VAL_ARRAY;
-                        parent_gather->result_value.as.array_val = final_results_array;
-
-                        // The internal gather_results array will be freed when the gather coroutine is freed.
-                        
                         // Now that the gather task is done and has its result,
                         // add it to the ready queue so it can wake up its awaiter.
                         add_to_ready_queue(interpreter, parent_gather);

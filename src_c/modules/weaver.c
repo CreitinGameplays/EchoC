@@ -190,6 +190,7 @@ static Value weaver_gather(Interpreter* interpreter, Value* args, int arg_count,
     gather_coro->gather_results->capacity = tasks_array->count;
     gather_coro->gather_results->elements = tasks_array->count > 0 ? calloc(tasks_array->count, sizeof(Value)) : NULL;
     gather_coro->gather_pending_count = tasks_array->count;
+    gather_coro->gather_return_exceptions = interpreter->gather_last_return_exceptions_flag;
     gather_coro->gather_first_exception_idx = -1;
 
     if (tasks_array->count == 0) {

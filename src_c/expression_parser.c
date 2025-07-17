@@ -632,7 +632,9 @@ Value interpret_any_function_call(Interpreter* interpreter, const char* func_nam
         } else {
             result = execute_echoc_function(interpreter, func_to_run, NULL, parsed_args, arg_count, func_name_token_for_error_reporting);
         }
-    } else { // Regular function call (not bound method)
+    }
+    // =================== START: ADD THIS NEW BLOCK ===================
+    else { // Regular function call (not bound method)
         if (!func_name_str_or_null_for_bound) {
             report_error("Internal", "Function name missing for non-bound call.", func_name_token_for_error_reporting);
         }
@@ -2155,19 +2157,45 @@ Value execute_echoc_function(Interpreter* interpreter, Function* func_to_call, O
 
     // --- START: C Function Dispatch ---
     if (func_to_call->c_impl) {
-        // This is a C function wrapped in a VAL_FUNCTION.
-        // Convert ParsedArgument to simple Value array and disallow named args for now.
-        Value simple_args[arg_count];
-        for (int i = 0; i < arg_count; ++i) {
-            if (parsed_args[i].name) {
-                char err_msg[250];
-                snprintf(err_msg, sizeof(err_msg), "Built-in module function '%s' does not support named arguments.", func_to_call->name);
-                report_error("Runtime", err_msg, call_site_token);
+        Value result;
+        // Special handling for `weaver.gather` to allow a named argument.
+        if (strcmp(func_to_call->name, "gather") == 0) {
+            Value tasks_array_val = create_null_value();
+            int positional_arg_count = 0;
+            interpreter->gather_last_return_exceptions_flag = false; // Reset before parsing
+
+            for (int i = 0; i < arg_count; i++) {
+                if (parsed_args[i].name) { // Named argument
+                    if (strcmp(parsed_args[i].name, "return_exceptions") == 0) {
+                        if (parsed_args[i].value.type != VAL_BOOL) report_error("Runtime", "'return_exceptions' argument for gather() must be a boolean.", call_site_token);
+                        interpreter->gather_last_return_exceptions_flag = parsed_args[i].value.as.bool_val;
+                    } else {
+                        char err_msg[250];
+                        snprintf(err_msg, sizeof(err_msg), "gather() got an unexpected keyword argument '%s'", parsed_args[i].name);
+                        report_error("Runtime", err_msg, call_site_token);
+                    }
+                } else { // Positional argument
+                    if (positional_arg_count == 0) tasks_array_val = parsed_args[i].value;
+                    positional_arg_count++;
+                }
             }
-            simple_args[i] = parsed_args[i].value;
+            if (positional_arg_count != 1) report_error("Runtime", "gather() expects exactly 1 positional argument (the array of tasks).", call_site_token);
+
+            Value simple_args[] = { tasks_array_val };
+            result = func_to_call->c_impl(interpreter, simple_args, 1, call_site_token);
+        } else {
+            // Default behavior for other C functions: disallow named args.
+            Value simple_args[arg_count];
+            for (int i = 0; i < arg_count; ++i) {
+                if (parsed_args[i].name) {
+                    char err_msg[250];
+                    snprintf(err_msg, sizeof(err_msg), "Built-in module function '%s' does not support named arguments.", func_to_call->name);
+                    report_error("Runtime", err_msg, call_site_token);
+                }
+                simple_args[i] = parsed_args[i].value;
+            }
+            result = func_to_call->c_impl(interpreter, simple_args, arg_count, call_site_token);
         }
-        // The C function is responsible for its own argument validation.
-        Value result = func_to_call->c_impl(interpreter, simple_args, arg_count, call_site_token);
 
         // After the C function is called, we must clean up the original parsed arguments.
         // The C function does not take ownership of the argument values' contents, so the
